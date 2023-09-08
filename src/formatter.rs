@@ -145,7 +145,7 @@ pub fn print_call(call: &Call, padding: usize, show_calls: &ShowCalls, resolve_h
                 .as_ref()
                 .map(|s| format!("Error: {}", s))
                 .unwrap_or("".to_string()),
-            call.gas
+            call.gas_used
         );
 
         if call.revert_reason.as_ref().is_some() || call.error.as_ref().is_some() {
