@@ -31,6 +31,11 @@ pub const ECPAIRING_PRECOMPILE_ADDRESS: Address = H160([
     0x00, 0x00, 0x00, 0x08,
 ]);
 
+pub const P256VERIFY_PRECOMPILE_ADDRESS: Address = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x19,
+]);
+
 pub const CONSOLE_PRECOMPILE_ADDRESS: Address = H160([
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0xFF,
@@ -158,6 +163,11 @@ pub static COMPILED_IN_SYSTEM_CONTRACTS: Lazy<Vec<DeployedContract>> = Lazy::new
             "EcPairing",
             ECPAIRING_PRECOMPILE_ADDRESS,
             include_bytes!("contracts/EcPairing.yul.zbin").to_vec(),
+        ),
+        (
+            "P256Verify",
+            P256VERIFY_PRECOMPILE_ADDRESS,
+            include_bytes!("contracts/P256VERIFY.yul.zbin").to_vec(),
         ),
         (
             "Console",
