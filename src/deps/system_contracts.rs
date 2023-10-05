@@ -36,6 +36,11 @@ pub const P256VERIFY_PRECOMPILE_ADDRESS: Address = H160([
     0x00, 0x00, 0x00, 0x19,
 ]);
 
+pub const SECP256K1VERIFY_PRECOMPILE_ADDRESS: Address = H160([
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x20,
+]);
+
 pub const CONSOLE_PRECOMPILE_ADDRESS: Address = H160([
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0xFF,
@@ -168,6 +173,11 @@ pub static COMPILED_IN_SYSTEM_CONTRACTS: Lazy<Vec<DeployedContract>> = Lazy::new
             "P256Verify",
             P256VERIFY_PRECOMPILE_ADDRESS,
             include_bytes!("contracts/P256VERIFY.yul.zbin").to_vec(),
+        ),
+        (
+            "SECP256K1VERIFY",
+            SECP256K1VERIFY_PRECOMPILE_ADDRESS,
+            include_bytes!("contracts/SECP256K1VERIFY.yul.zbin").to_vec(),
         ),
         (
             "Console",
