@@ -175,7 +175,7 @@ pub static COMPILED_IN_SYSTEM_CONTRACTS: Lazy<Vec<DeployedContract>> = Lazy::new
             include_bytes!("contracts/P256VERIFY.yul.zbin").to_vec(),
         ),
         (
-            "SECP256K1VERIFY",
+            "secp256k1VERIFY",
             SECP256K1VERIFY_PRECOMPILE_ADDRESS,
             include_bytes!("contracts/secp256k1VERIFY.yul.zbin").to_vec(),
         ),
