@@ -1,13 +1,19 @@
+use std::collections::HashMap;
 use std::pin::Pin;
 
 use futures::Future;
-use vm::vm_with_bootloader::{
-    derive_base_fee_and_gas_per_pubdata, BLOCK_OVERHEAD_GAS, BLOCK_OVERHEAD_PUBDATA,
-    BOOTLOADER_TX_ENCODING_SPACE,
-};
-use zksync_basic_types::U256;
-use zksync_types::{zk_evm::zkevm_opcode_defs::system_params::MAX_TX_ERGS_LIMIT, MAX_TXS_IN_BLOCK};
-use zksync_utils::ceil_div_u256;
+use vm::{HistoryDisabled, Vm};
+use zksync_basic_types::{U256, U64};
+use zksync_state::StorageView;
+use zksync_state::WriteStorage;
+use zksync_types::api::BlockNumber;
+use zksync_utils::u256_to_h256;
+
+use crate::node::create_empty_block;
+use crate::{fork::ForkSource, node::InMemoryNodeInner};
+use vm::utils::fee::derive_base_fee_and_gas_per_pubdata;
+
+use zksync_utils::{bytecode::hash_bytecode, bytes_to_be_words};
 
 pub(crate) trait IntoBoxedFuture: Sized + Send + 'static {
     fn into_boxed_future(self) -> Pin<Box<dyn Future<Output = Self> + Send>> {
@@ -20,76 +26,6 @@ where
     T: Send + 'static,
     U: Send + 'static,
 {
-}
-
-/// Derives the gas estimation overhead based on the given gas limit, gas price per pubdata, and encoded length.
-///
-/// # Arguments
-///
-/// * `gas_limit` - A `u32` representing the gas limit.
-/// * `gas_price_per_pubdata` - A `u32` representing the gas price per pubdata.
-/// * `encoded_len` - A `usize` representing the encoded length.
-///
-/// # Returns
-///
-/// A `u32` representing the derived gas estimation overhead.
-pub fn derive_gas_estimation_overhead(
-    gas_limit: u32,
-    gas_price_per_pubdata: u32,
-    encoded_len: usize,
-) -> u32 {
-    // Even if the gas limit is greater than the MAX_TX_ERGS_LIMIT, we assume that everything beyond MAX_TX_ERGS_LIMIT
-    // will be spent entirely on publishing bytecodes and so we derive the overhead solely based on the capped value
-    let gas_limit = std::cmp::min(MAX_TX_ERGS_LIMIT, gas_limit);
-
-    // Using large U256 type to avoid overflow
-    let max_block_overhead = U256::from(block_overhead_gas(gas_price_per_pubdata));
-    let gas_limit = U256::from(gas_limit);
-    let encoded_len = U256::from(encoded_len);
-
-    // The MAX_TX_ERGS_LIMIT is formed in a way that may fullfills a single-instance circuits
-    // if used in full. That is, within MAX_TX_ERGS_LIMIT it is possible to fully saturate all the single-instance
-    // circuits.
-    let overhead_for_single_instance_circuits =
-        ceil_div_u256(gas_limit * max_block_overhead, MAX_TX_ERGS_LIMIT.into());
-
-    // The overhead for occupying the bootloader memory
-    let overhead_for_length = ceil_div_u256(
-        encoded_len * max_block_overhead,
-        BOOTLOADER_TX_ENCODING_SPACE.into(),
-    );
-
-    // The overhead for occupying a single tx slot
-    let tx_slot_overhead = ceil_div_u256(max_block_overhead, MAX_TXS_IN_BLOCK.into());
-
-    // For L2 transactions we allow a certain default discount with regard to the number of ergs.
-    // Multiinstance circuits can in theory be spawned infinite times, while projected future limitations
-    // on gas per pubdata allow for roughly 800k gas per L1 batch, so the rough trust "discount" on the proof's part
-    // to be paid by the users is 0.1.
-    const ERGS_LIMIT_OVERHEAD_COEFFICIENT: f64 = 0.1;
-
-    vec![
-        (ERGS_LIMIT_OVERHEAD_COEFFICIENT * overhead_for_single_instance_circuits.as_u32() as f64)
-            .floor() as u32,
-        overhead_for_length.as_u32(),
-        tx_slot_overhead.as_u32(),
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(0)
-}
-
-/// Calculates the total gas cost of the block overhead, including the gas cost of the public data.
-///
-/// # Arguments
-///
-/// * `gas_per_pubdata_byte` - The gas cost per byte of public data.
-///
-/// # Returns
-///
-/// The total gas cost of the block overhead, including the gas cost of the public data.
-pub fn block_overhead_gas(gas_per_pubdata_byte: u32) -> u32 {
-    BLOCK_OVERHEAD_GAS + BLOCK_OVERHEAD_PUBDATA * gas_per_pubdata_byte
 }
 
 /// Adjusts the L1 gas price for a transaction based on the current pubdata price and the fair L2 gas price.
@@ -121,5 +57,328 @@ pub fn adjust_l1_gas_price_for_tx(
             / U256::from(17);
 
         l1_gas_price.as_u64()
+    }
+}
+
+/// Takes long integers and returns them in human friendly format with "_".
+/// For example: 12_334_093
+pub fn to_human_size(input: U256) -> String {
+    let input = format!("{:?}", input);
+    let tmp: Vec<_> = input
+        .chars()
+        .rev()
+        .enumerate()
+        .flat_map(|(index, val)| {
+            if index > 0 && index % 3 == 0 {
+                vec!['_', val]
+            } else {
+                vec![val]
+            }
+        })
+        .collect();
+    tmp.iter().rev().collect()
+}
+
+pub fn bytecode_to_factory_dep(bytecode: Vec<u8>) -> (U256, Vec<U256>) {
+    let bytecode_hash = hash_bytecode(&bytecode);
+    let bytecode_hash = U256::from_big_endian(bytecode_hash.as_bytes());
+
+    let bytecode_words = bytes_to_be_words(bytecode);
+
+    (bytecode_hash, bytecode_words)
+}
+
+/// Creates and inserts a given number of empty blocks into the node, with a given interval between them.
+/// The blocks will be empty (contain no transactions).
+/// Currently this is quite slow - as we invoke the VM for each operation, in the future we might want to optimise it
+/// by adding a way to set state via some system contract call.
+pub fn mine_empty_blocks<S: std::fmt::Debug + ForkSource>(
+    node: &mut InMemoryNodeInner<S>,
+    num_blocks: u64,
+    interval_ms: u64,
+) {
+    // build and insert new blocks
+    for i in 0..num_blocks {
+        // roll the vm
+        let (keys, bytecodes, block_ctx) = {
+            let storage = StorageView::new(&node.fork_storage).to_rc_ptr();
+
+            // system_contract.contracts_for_l2_call() will give playground contracts
+            // we need these to use the unsafeOverrideBlock method in SystemContext.sol
+            let bootloader_code = node.system_contracts.contracts_for_l2_call();
+            let (batch_env, mut block_ctx) = node.create_l1_batch_env(storage.clone());
+            // override the next block's timestamp to match up with interval for subsequent blocks
+            if i != 0 {
+                block_ctx.timestamp = node.current_timestamp.saturating_add(interval_ms);
+            }
+
+            // init vm
+            let system_env =
+                node.create_system_env(bootloader_code.clone(), vm::TxExecutionMode::VerifyExecute);
+
+            let mut vm = Vm::new(batch_env, system_env, storage.clone(), HistoryDisabled);
+
+            vm.execute(vm::VmExecutionMode::Bootloader);
+
+            let bytecodes: HashMap<U256, Vec<U256>> = vm
+                .get_last_tx_compressed_bytecodes()
+                .iter()
+                .map(|b| bytecode_to_factory_dep(b.original.clone()))
+                .collect();
+            let modified_keys = storage.borrow().modified_storage_keys().clone();
+            (modified_keys, bytecodes, block_ctx)
+        };
+
+        for (key, value) in keys.iter() {
+            node.fork_storage.set_value(*key, *value);
+        }
+
+        // Write all the factory deps.
+        for (hash, code) in bytecodes.iter() {
+            node.fork_storage.store_factory_dep(
+                u256_to_h256(*hash),
+                code.iter()
+                    .flat_map(|entry| {
+                        let mut bytes = vec![0u8; 32];
+                        entry.to_big_endian(&mut bytes);
+                        bytes.to_vec()
+                    })
+                    .collect(),
+            )
+        }
+
+        let block = create_empty_block(block_ctx.miniblock, block_ctx.timestamp, block_ctx.batch);
+
+        node.block_hashes.insert(block.number.as_u64(), block.hash);
+        node.blocks.insert(block.hash, block);
+
+        // leave node state ready for next interaction
+        node.current_batch = block_ctx.batch;
+        node.current_miniblock = block_ctx.miniblock;
+        node.current_timestamp = block_ctx.timestamp;
+    }
+}
+
+/// Returns the actual [U64] block number from [BlockNumber].
+///
+/// # Arguments
+///
+/// * `block_number` - [BlockNumber] for a block.
+/// * `latest_block_number` - A [U64] representing the latest block number.
+///
+/// # Returns
+///
+/// A [U64] representing the input block number.
+pub fn to_real_block_number(block_number: BlockNumber, latest_block_number: U64) -> U64 {
+    match block_number {
+        BlockNumber::Finalized
+        | BlockNumber::Pending
+        | BlockNumber::Committed
+        | BlockNumber::Latest => latest_block_number,
+        BlockNumber::Earliest => U64::zero(),
+        BlockNumber::Number(n) => n,
+    }
+}
+
+/// Returns a [jsonrpc_core::Error] indicating that the method is not implemented.
+pub fn not_implemented<T: Send + 'static>(
+    method_name: &str,
+) -> jsonrpc_core::BoxFuture<Result<T, jsonrpc_core::Error>> {
+    log::warn!("Method {} is not implemented", method_name);
+    Err(jsonrpc_core::Error {
+        data: None,
+        code: jsonrpc_core::ErrorCode::MethodNotFound,
+        message: format!("Method {} is not implemented", method_name),
+    })
+    .into_boxed_future()
+}
+
+#[cfg(test)]
+mod tests {
+    use zksync_basic_types::{H256, U256};
+
+    use crate::{http_fork_source::HttpForkSource, node::InMemoryNode, testing};
+
+    use super::*;
+
+    #[test]
+    fn test_human_sizes() {
+        assert_eq!("123", to_human_size(U256::from(123u64)));
+        assert_eq!("1_234", to_human_size(U256::from(1234u64)));
+        assert_eq!("12_345", to_human_size(U256::from(12345u64)));
+        assert_eq!("0", to_human_size(U256::from(0)));
+        assert_eq!("1", to_human_size(U256::from(1)));
+        assert_eq!("250_000_000", to_human_size(U256::from(250000000u64)));
+    }
+
+    #[test]
+    fn test_to_real_block_number_finalized() {
+        let actual = to_real_block_number(BlockNumber::Finalized, U64::from(10));
+        assert_eq!(U64::from(10), actual);
+    }
+
+    #[test]
+    fn test_to_real_block_number_pending() {
+        let actual = to_real_block_number(BlockNumber::Pending, U64::from(10));
+        assert_eq!(U64::from(10), actual);
+    }
+
+    #[test]
+    fn test_to_real_block_number_committed() {
+        let actual = to_real_block_number(BlockNumber::Committed, U64::from(10));
+        assert_eq!(U64::from(10), actual);
+    }
+
+    #[test]
+    fn test_to_real_block_number_latest() {
+        let actual = to_real_block_number(BlockNumber::Latest, U64::from(10));
+        assert_eq!(U64::from(10), actual);
+    }
+
+    #[test]
+    fn test_to_real_block_number_earliest() {
+        let actual = to_real_block_number(BlockNumber::Earliest, U64::from(10));
+        assert_eq!(U64::zero(), actual);
+    }
+
+    #[test]
+    fn test_to_real_block_number_number() {
+        let actual = to_real_block_number(BlockNumber::Number(U64::from(5)), U64::from(10));
+        assert_eq!(U64::from(5), actual);
+    }
+
+    #[test]
+    fn test_mine_empty_blocks_mines_the_first_block_immediately() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+
+        let starting_block = {
+            let reader = inner.read().expect("failed acquiring reader");
+            reader
+                .block_hashes
+                .get(&reader.current_miniblock)
+                .and_then(|hash| reader.blocks.get(hash))
+                .expect("failed finding block")
+                .clone()
+        };
+        assert_eq!(U64::from(0), starting_block.number);
+        assert_eq!(Some(U64::from(0)), starting_block.l1_batch_number);
+        assert_eq!(U256::from(1000), starting_block.timestamp);
+
+        {
+            let mut writer = inner.write().expect("failed acquiring write lock");
+            mine_empty_blocks(&mut writer, 1, 1000);
+        }
+
+        let reader = inner.read().expect("failed acquiring reader");
+        let mined_block = reader
+            .block_hashes
+            .get(&1)
+            .and_then(|hash| reader.blocks.get(hash))
+            .expect("failed finding block");
+        assert_eq!(U64::from(1), mined_block.number);
+        assert_eq!(Some(U64::from(1)), mined_block.l1_batch_number);
+        assert_eq!(U256::from(1001), mined_block.timestamp);
+    }
+
+    #[test]
+    fn test_mine_empty_blocks_mines_2_blocks_with_interval() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+
+        let starting_block = {
+            let reader = inner.read().expect("failed acquiring reader");
+            reader
+                .block_hashes
+                .get(&reader.current_miniblock)
+                .and_then(|hash| reader.blocks.get(hash))
+                .expect("failed finding block")
+                .clone()
+        };
+        assert_eq!(U64::from(0), starting_block.number);
+        assert_eq!(Some(U64::from(0)), starting_block.l1_batch_number);
+        assert_eq!(U256::from(1000), starting_block.timestamp);
+
+        {
+            let mut writer = inner.write().expect("failed acquiring write lock");
+            mine_empty_blocks(&mut writer, 2, 1000);
+        }
+
+        let reader = inner.read().expect("failed acquiring reader");
+        let mined_block_1 = reader
+            .block_hashes
+            .get(&1)
+            .and_then(|hash| reader.blocks.get(hash))
+            .expect("failed finding block 1");
+        assert_eq!(U64::from(1), mined_block_1.number);
+        assert_eq!(Some(U64::from(1)), mined_block_1.l1_batch_number);
+        assert_eq!(U256::from(1001), mined_block_1.timestamp);
+
+        let mined_block_2 = reader
+            .block_hashes
+            .get(&2)
+            .and_then(|hash| reader.blocks.get(hash))
+            .expect("failed finding block 2");
+        assert_eq!(U64::from(2), mined_block_2.number);
+        assert_eq!(Some(U64::from(2)), mined_block_2.l1_batch_number);
+        assert_eq!(U256::from(2001), mined_block_2.timestamp);
+    }
+
+    #[test]
+    fn test_mine_empty_blocks_mines_2_blocks_with_interval_and_next_block_immediately() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+
+        let starting_block = {
+            let reader = inner.read().expect("failed acquiring reader");
+            reader
+                .block_hashes
+                .get(&reader.current_miniblock)
+                .and_then(|hash| reader.blocks.get(hash))
+                .expect("failed finding block")
+                .clone()
+        };
+        assert_eq!(U64::from(0), starting_block.number);
+        assert_eq!(Some(U64::from(0)), starting_block.l1_batch_number);
+        assert_eq!(U256::from(1000), starting_block.timestamp);
+
+        {
+            let mut writer = inner.write().expect("failed acquiring write lock");
+            mine_empty_blocks(&mut writer, 2, 1000);
+        }
+
+        {
+            let reader = inner.read().expect("failed acquiring reader");
+            let mined_block_1 = reader
+                .block_hashes
+                .get(&1)
+                .and_then(|hash| reader.blocks.get(hash))
+                .expect("failed finding block 1");
+            assert_eq!(U64::from(1), mined_block_1.number);
+            assert_eq!(Some(U64::from(1)), mined_block_1.l1_batch_number);
+            assert_eq!(U256::from(1001), mined_block_1.timestamp);
+
+            let mined_block_2 = reader
+                .block_hashes
+                .get(&2)
+                .and_then(|hash| reader.blocks.get(hash))
+                .expect("failed finding block 2");
+            assert_eq!(U64::from(2), mined_block_2.number);
+            assert_eq!(Some(U64::from(2)), mined_block_2.l1_batch_number);
+            assert_eq!(U256::from(2001), mined_block_2.timestamp);
+        }
+
+        {
+            testing::apply_tx(&node, H256::repeat_byte(0x1));
+            let reader = inner.read().expect("failed acquiring reader");
+            let tx_block_3 = reader
+                .block_hashes
+                .get(&3)
+                .and_then(|hash| reader.blocks.get(hash))
+                .expect("failed finding block 2");
+            assert_eq!(U64::from(3), tx_block_3.number);
+            assert_eq!(Some(U64::from(3)), tx_block_3.l1_batch_number);
+            assert_eq!(U256::from(2002), tx_block_3.timestamp);
+        }
     }
 }

@@ -15,10 +15,15 @@ clean-contracts:
 rebuild-contracts:
 	cd etc/system-contracts && yarn build; yarn preprocess; yarn build-bootloader
 	./scripts/refresh_contracts.sh
+	./scripts/refresh_test_contracts.sh
 
 # Build the Rust project
 rust-build:
 	cargo build --release
+
+# Run local
+run: rust-build
+	./target/release/era_test_node run
 
 # Build the Rust project for a specific target. Primarily used for CI.
 build-%:
@@ -30,17 +35,23 @@ rust-doc:
 
 # Lint checks for Rust code
 lint:
+	cd e2e-tests && yarn && yarn lint && yarn fmt && yarn typecheck
 	cargo fmt --all -- --check
-	cargo clippy -Zunstable-options -- -D warnings --allow clippy::unwrap_used
+	cargo clippy -p era_test_node -Zunstable-options -- -D warnings --allow clippy::unwrap_used
 
 # Fix lint errors for Rust code
 lint-fix:
+	cd e2e-tests && yarn && yarn lint:fix && yarn fmt:fix
 	cargo clippy --fix
 	cargo fmt
 
 # Run unit tests for Rust code
 test:
 	cargo test
+
+# Run e2e tests against running era_test_node
+test-e2e:
+	./scripts/execute-e2e-tests.sh
 
 # Build everything
 all: build-contracts rust-build
@@ -55,4 +66,4 @@ new-release-tag:
 	echo "\n\033[0;32mGit tag creation SUCCESSFUL! Use the following command to push the tag:\033[0m" && \
 	echo "git push origin v$$VERSION_NUMBER"
 
-.PHONY: build-contracts clean-contracts rebuild-contracts rust-build lint test all clean build-% new-release-tag
+.PHONY: build-contracts clean-contracts rebuild-contracts rust-build lint test test-e2e all clean build-% new-release-tag

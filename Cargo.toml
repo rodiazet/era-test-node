@@ -1,6 +1,6 @@
 [package]
 name = "era_test_node"
-version = "0.0.1-alpha"
+version = "0.1.0-alpha.5"
 edition = "2018"
 authors = ["The Matter Labs Team <hello@matterlabs.dev>"]
 homepage = "https://zksync.io/"
@@ -11,21 +11,24 @@ categories = ["cryptography"]
 publish = false # We don't want to publish our binaries.
 
 [dependencies]
-zksync_basic_types = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
-zksync_core = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
-vm = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
-vlog = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
-zksync_contracts = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
-zksync_types = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
-zksync_utils = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
-zksync_state = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
-zksync_web3_decl = { git = "https://github.com/lambdaclass/zksync-era.git", branch = "return-data-length" }
+zksync_basic_types = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+zksync_core = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+vm = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+vlog = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+zksync_contracts = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+zksync_types = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+zksync_utils = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+zksync_state = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+zksync_web3_decl = { git = "https://github.com/matter-labs/zksync-era.git", rev = "8df11278ca76000d842fc0f73f5233dfc85ef77e" }
+
+
+
+openssl-sys = { version = "0.9", features = ["vendored"] }
 
 anyhow = "1.0"
 tokio = { version = "1", features = ["time", "rt"] }
 futures = { version = "0.3", features = ["compat"] }
 once_cell = "1.7"
-
 
 jsonrpc-http-server = { git = "https://github.com/matter-labs/jsonrpc.git", branch = "master" }
 jsonrpc-core = { git = "https://github.com/matter-labs/jsonrpc.git", branch = "master" }
@@ -45,3 +48,14 @@ bigdecimal = { version = "0.2.0" }
 hex = "0.4"
 ethabi = "16.0.0"
 itertools = "0.10.5"
+log = "0.4.20"
+simplelog = "0.12.1"
+rustc-hash = "1.1.0"
+indexmap = "2.0.1"
+
+[dev-dependencies]
+httptest = "0.15.4"
+tempdir = "0.3.7"
+maplit = "1.0.2"
+zksync-web3-rs = "0.1.1"
+ethers = { version = "2.0.4", features = ["rustls"] }

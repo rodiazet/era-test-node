@@ -1,17 +1,14 @@
 use std::collections::HashMap;
 pub mod system_contracts;
 use zksync_types::{
-    get_code_key, get_known_code_key, get_system_context_init_logs,
-    system_contracts::get_system_smart_contracts, L2ChainId, StorageKey, StorageLog,
-    StorageLogKind, StorageValue, H256,
+    get_code_key, get_known_code_key, get_system_context_init_logs, L2ChainId, StorageKey,
+    StorageLog, StorageLogKind, StorageValue, H256,
 };
 
 use std::fmt;
 
-use self::system_contracts::COMPILED_IN_SYSTEM_CONTRACTS;
-
 /// In-memory storage.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct InMemoryStorage {
     pub(crate) state: HashMap<StorageKey, StorageValue>,
     pub(crate) factory_deps: HashMap<H256, Vec<u8>>,
@@ -22,13 +19,10 @@ impl InMemoryStorage {
     pub fn with_system_contracts_and_chain_id(
         chain_id: L2ChainId,
         bytecode_hasher: impl Fn(&[u8]) -> H256,
-        load_contracts_from_files: bool,
+        system_contracts_options: &crate::system_contracts::Options,
     ) -> Self {
-        let contracts = if load_contracts_from_files {
-            get_system_smart_contracts()
-        } else {
-            COMPILED_IN_SYSTEM_CONTRACTS.clone()
-        };
+        let contracts = crate::system_contracts::get_deployed_contracts(system_contracts_options);
+
         let system_context_init_log = get_system_context_init_logs(chain_id);
 
         let state = contracts
@@ -113,7 +107,7 @@ pub trait ReadStorage: fmt::Debug {
 
 /// Functionality to write to the VM storage in a batch.
 ///
-/// So far, this trait is implemented only for [`StorageView`].
+/// So far, this trait is implemented only for [`zksync_state::StorageView`].
 pub trait WriteStorage: ReadStorage {
     /// Sets the new value under a given key and returns the previous value.
     fn set_value(&mut self, key: StorageKey, value: StorageValue) -> StorageValue;

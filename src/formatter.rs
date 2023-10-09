@@ -1,5 +1,5 @@
 //! Helper methods to display transaction data in more human readable way.
-use crate::{resolver, ShowCalls};
+use crate::{node::ShowCalls, resolver};
 
 use colored::Colorize;
 use serde::Deserialize;
@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use crate::fork::block_on;
 use zksync_basic_types::H160;
 
-use zksync_types::{vm_trace::Call, VmEvent};
+use vm::VmExecutionResultAndLogs;
+use zksync_types::{vm_trace::Call, StorageLogQuery, StorageLogQueryType, VmEvent};
 
 use lazy_static::lazy_static;
 
@@ -58,20 +59,21 @@ pub fn print_event(event: &VmEvent, resolve_hashes: bool) {
     block_on(async move {
         let mut tt: Vec<String> = vec![];
         if !resolve_hashes {
-            tt = event.indexed_topics.iter().map(|t| t.to_string()).collect();
+            tt = event
+                .indexed_topics
+                .iter()
+                .map(|t| format!("{:#x}", t))
+                .collect();
         } else {
             for topic in event.indexed_topics {
-                let selector = resolver::decode_event_selector(&format!(
-                    "0x{}",
-                    hex::encode(topic.as_bytes())
-                ))
-                .await
-                .unwrap();
-                tt.push(selector.unwrap_or(format!("{:?}", topic)));
+                let selector = resolver::decode_event_selector(&format!("{:#x}", topic))
+                    .await
+                    .unwrap();
+                tt.push(selector.unwrap_or(format!("{:#x}", topic)));
             }
         }
 
-        println!(
+        log::info!(
             "{} {}",
             address_to_human_readable(event.address)
                 .map(|x| format!("{:42}", x.blue()))
@@ -135,26 +137,87 @@ pub fn print_call(call: &Call, padding: usize, show_calls: &ShowCalls, resolve_h
             call.r#type,
             address_to_human_readable(call.to)
                 .map(|x| format!("{:<52}", x))
-                .unwrap_or(format!("{:<52}", format!("{:?}", call.to).bold()).to_string()),
+                .unwrap_or(format!("{:<52}", format!("{:?}", call.to).bold())),
             function_signature,
             call.revert_reason
                 .as_ref()
                 .map(|s| format!("Revert: {}", s))
-                .unwrap_or("".to_string()),
+                .unwrap_or_default(),
             call.error
                 .as_ref()
                 .map(|s| format!("Error: {}", s))
-                .unwrap_or("".to_string()),
+                .unwrap_or_default(),
             call.gas
         );
 
         if call.revert_reason.as_ref().is_some() || call.error.as_ref().is_some() {
-            println!("{}", pretty_print.on_red());
+            log::info!("{}", pretty_print.on_red());
         } else {
-            println!("{}", pretty_print);
+            log::info!("{}", pretty_print);
         }
     }
     for subcall in &call.calls {
         print_call(subcall, padding + 2, show_calls, resolve_hashes);
     }
+}
+
+pub fn print_logs(log_query: &StorageLogQuery) {
+    let separator = "─".repeat(82);
+    log::info!("{:<15} {:?}", "Type:", log_query.log_type);
+    log::info!(
+        "{:<15} {}",
+        "Address:",
+        address_to_human_readable(log_query.log_query.address)
+            .unwrap_or(format!("{}", log_query.log_query.address))
+    );
+    log::info!("{:<15} {:#066x}", "Key:", log_query.log_query.key);
+
+    log::info!(
+        "{:<15} {:#066x}",
+        "Read Value:",
+        log_query.log_query.read_value
+    );
+
+    if log_query.log_type != StorageLogQueryType::Read {
+        log::info!(
+            "{:<15} {:#066x}",
+            "Written Value:",
+            log_query.log_query.written_value
+        );
+    }
+    log::info!("{}", separator);
+}
+
+pub fn print_vm_details(result: &VmExecutionResultAndLogs) {
+    log::info!("");
+    log::info!("┌──────────────────────────┐");
+    log::info!("│   VM EXECUTION RESULTS   │");
+    log::info!("└──────────────────────────┘");
+
+    log::info!("Cycles Used:          {}", result.statistics.cycles_used);
+    log::info!(
+        "Computation Gas Used: {}",
+        result.statistics.computational_gas_used
+    );
+    log::info!("Contracts Used:       {}", result.statistics.contracts_used);
+    match &result.result {
+        vm::ExecutionResult::Success { .. } => {}
+        vm::ExecutionResult::Revert { output } => {
+            log::info!("");
+            log::info!(
+                "{}",
+                format!(
+                    "\n[!] Revert Reason:    {}",
+                    output.to_user_friendly_string()
+                )
+                .on_red()
+            );
+        }
+        vm::ExecutionResult::Halt { reason } => {
+            log::info!("");
+            log::info!("{}", format!("\n[!] Halt Reason:    {}", reason).on_red());
+        }
+    }
+
+    log::info!("════════════════════════════");
 }

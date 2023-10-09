@@ -2,7 +2,7 @@
 <a href="https://era.zksync.io/docs/tools/testing/era-test-node.html">
 
 ![era-test-node](./.github/assets/era_test_node_banner_light.png#gh-light-mode-only)
-![Webb Logo](./.github/assets/era_test_node_banner_dark.png#gh-dark-mode-only)
+![era-test-node](./.github/assets/era_test_node_banner_dark.png#gh-dark-mode-only)
 </a>
 
   </div>
@@ -11,8 +11,7 @@
 
 This crate provides an in-memory node that supports forking the state from other networks.
 
-The goal of this crate is to offer a fast solution for integration testing, bootloader and system contract testing, and
-prototyping.
+The goal of this crate is to offer a fast solution for integration testing, bootloader and system contract testing, and prototyping.
 
 🔗 For a detailed walkthrough, refer to the [official documentation](https://era.zksync.io/docs/tools/testing/era-test-node.html).
 
@@ -47,14 +46,56 @@ Please note that `era-test-node` is still in its **alpha** stage. Some features 
 
 ## 📥 Installation & Setup
 
-1. Install `era-test-node`:
+1. Download `era-test-node` from latest [Release](https://github.com/matter-labs/era-test-node/releases/latest)
+
+2. Extract the binary and mark as executable:
    ```bash
-   cargo install --git https://github.com/matter-labs/era-test-node.git --locked
+   tar xz -f era_test_node.tar.gz -C /usr/local/bin/
+   chmod +x /usr/local/bin/era_test_node
    ```
-2. Start the node:
+
+3. Start the node:
    ```bash
    era_test_node run
    ```
+
+## 🧑‍💻 Running Locally
+
+1. Compile Rust project and start the node:
+   ```bash
+   make run
+   ```
+
+## 📃 Logging
+
+The node may be started in either of `debug`, `info`, `warn` or `error` logging levels via the `--log` option:
+```bash
+era_test_node --log=error run
+```
+
+Additionally, the file path can be provided via the `--log-file-path` option (defaults to `./era_test_node.log`):
+```bash
+era_test_node --log=error --log-file-path=run.log run
+```
+
+## 📃 Caching
+
+The node will cache certain network request by default to disk in the `.cache` directory. Alternatively the caching can be disabled or set to in-memory only
+via the `--cache=none|memory|disk` parameter. 
+
+```bash
+era_test_node --cache=none run
+```
+
+```bash
+era_test_node --cache=memory run
+```
+
+Additionally when using `--cache=disk`, the cache directory may be specified via `--cache-dir` and the cache may
+be reset on startup via `--reset-cache` parameters.
+```bash
+era_test_node --cache=disk --cache-dir=/tmp/foo --reset-cache run
+```
 
 ## 🌐 Network Details
 
@@ -99,17 +140,44 @@ But with --show-calls flag, it can print more detailed call traces, and with --r
 era_test_node --show-calls=user --resolve-hashes replay_tx testnet 0x7f039bcbb1490b855be37e74cf2400503ad57f51c84856362f99b0cbf1ef478a
 
 Executing 0x7f039bcbb1490b855be37e74cf2400503ad57f51c84856362f99b0cbf1ef478a
+┌─────────────────────────┐
+│   TRANSACTION SUMMARY   │
+└─────────────────────────┘
 Transaction: SUCCESS
-Initiator: 0x55362182242a4de20ea8a0ec055b2134bb24e23d Payer: 0x55362182242a4de20ea8a0ec055b2134bb24e23d
-Gas Limit: 797128 used: 399148 refunded: 397980
-18 call traces. Use --show-calls flag to display more info.
-Call(Normal) 0x55362182242a4de20ea8a0ec055b2134bb24e23d 0x202bcce7   729918
-  Call(Normal) 0x0000000000000000000000000000000000000001 0xbb1e83e6   688275
-Call(Normal) 0x55362182242a4de20ea8a0ec055b2134bb24e23d 0xe2f318e3   693630
-Call(Normal) 0x55362182242a4de20ea8a0ec055b2134bb24e23d 0xdf9c1589   624834
-    Call(Mimic) 0x6eef3310e09df3aa819cc2aa364d4f3ad2e6ffe3 swapExactETHForTokens(uint256,address[],address,uint256)   562275
-      Call(Normal) 0x053f26a020de152a947b8ba7d8974c85c5fc5b81 getPair(address,address)   544068
+Initiator: 0x55362182242a4de20ea8a0ec055b2134bb24e23d
+Payer: 0x55362182242a4de20ea8a0ec055b2134bb24e23d
+Gas - Limit: 797128 | Used: 351250 | Refunded: 445878
 
+==== Console logs: 
+
+==== 18 call traces.  Use --show-calls flag or call config_setShowCalls to display more info.
+Call(Normal) 0x55362182242a4de20ea8a0ec055b2134bb24e23d           validateTransaction(bytes32, bytes32, tuple)   730485
+  Call(Normal) 0x0000000000000000000000000000000000000001                 0xbb1e83e6   698040
+Call(Normal) 0x55362182242a4de20ea8a0ec055b2134bb24e23d           payForTransaction(bytes32, bytes32, tuple)   703647
+Call(Normal) 0x55362182242a4de20ea8a0ec055b2134bb24e23d           executeTransaction(bytes32, bytes32, tuple)   647199
+    Call(Mimic) 0x6eef3310e09df3aa819cc2aa364d4f3ad2e6ffe3           swapExactETHForTokens(uint256,address[],address,uint256)   596358
+      Call(Normal) 0x053f26a020de152a947b8ba7d8974c85c5fc5b81           getPair(address,address)   577647
+
+```
+
+You can use the following options to get more granular information during transaction processing:
+
+- `--show-storage-logs <SHOW_STORAGE_LOGS>`: Show storage log information.  
+  [default: none]  
+  [possible values: none, read, write, all]
+
+- `--show-vm-details <SHOW_VM_DETAILS>`: Show VM details information.  
+  [default: none]  
+  [possible values: none, all]
+
+- `--show-gas-details <SHOW_GAS_DETAILS>`: Show Gas details information.  
+  [default: none]  
+  [possible values: none, all]
+
+Example:
+
+```bash
+era_test_node --show-storage-logs=all --show-vm-details=all --show-gas-details=all run
 ```
 
 ## 💰 Using Rich Wallets
@@ -124,12 +192,47 @@ Here's a list of the available rich wallets:
 | `0xa61464658AfeAf65CccaaFD3a512b69A83B77618` | `0xac1e735be8536c6534bb4f17f06f6afc73b2b5ba84ac2cfb12f7461b20c0bbe3` |
 | `0x0D43eB5B8a47bA8900d84AA36656c92024e9772e` | `0xd293c684d884d56f8d6abd64fc76757d3664904e309a0645baf8522ab6366d9e` |
 | `0xA13c10C0D5bd6f79041B9835c63f91de35A15883` | `0x850683b40d4a740aa6e745f889a6fdc8327be76e122f5aba645a5b02d0248db8` |
+| `0x8002cD98Cfb563492A6fB3E7C8243b7B9Ad4cc92` | `0xf12e28c0eb1ef4ff90478f6805b68d63737b7f33abfa091601140805da450d93` |
+| `0x4F9133D1d3F50011A6859807C837bdCB31Aaab13` | `0xe667e57a9b8aaa6709e51ff7d093f1c5b73b63f9987e4ab4aa9a5c699e024ee8` |
+| `0xbd29A1B981925B94eEc5c4F1125AF02a2Ec4d1cA` | `0x28a574ab2de8a00364d5dd4b07c4f2f574ef7fcc2a86a197f65abaec836d1959` |
+| `0xedB6F5B4aab3dD95C7806Af42881FF12BE7e9daa` | `0x74d8b3a188f7260f67698eb44da07397a298df5427df681ef68c45b34b61f998` |
+| `0xe706e60ab5Dc512C36A4646D719b889F398cbBcB` | `0xbe79721778b48bcc679b78edac0ce48306a8578186ffcb9f2ee455ae6efeace1` |
+| `0xE90E12261CCb0F3F7976Ae611A29e84a6A85f424` | `0x3eb15da85647edd9a1159a4a13b9e7c56877c4eb33f614546d4db06a51868b1c` |
 
 Feel free to use these wallets in your tests, but remember, they are for development purposes only and should not be used in production or with real assets.
 
 ## 🔧 Supported APIs
 
 See our list of [Supported APIs here](SUPPORTED_APIS.md).
+
+## 🤖 CI/CD Testing with GitHub Actions
+
+A GitHub Action is available for integrating `era-test-node` into your CI/CD environments. This action offers high configurability and streamlines the process of testing your applications in an automated way.
+
+You can find this GitHub Action in the marketplace [here](https://github.com/marketplace/actions/era-test-node-action).
+
+### 📝 Example Usage
+
+Below is an example `yaml` configuration to use the `era-test-node` GitHub Action in your workflow:
+
+```yml
+name: Run Era Test Node Action
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+
+    - name: Run Era Test Node
+      uses: dutterbutter/era-test-node-action@latest
+```
 
 ## 🤝 Contributing
 

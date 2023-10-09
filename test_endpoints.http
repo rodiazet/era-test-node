@@ -71,7 +71,51 @@ content-type: application/json
 {
     "jsonrpc": "2.0",
     "id": "1",
+    "method": "config_getCurrentTimestamp",
+    "params": []
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
     "method": "config_setShowCalls",
+    "params": ["All"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "config_setShowStorageLogs",
+    "params": ["All"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "config_setShowVmDetails",
+    "params": ["All"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "config_setShowGasDetails",
     "params": ["All"]
 }
 
@@ -84,6 +128,25 @@ content-type: application/json
     "id": "1",
     "method": "config_setResolveHashes",
     "params": [true]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "debug_traceCall",
+    "params": [{
+        "to": "0x36615Cf349d7F6344891B1e7CA7C72883F5dc049",
+        "data": "0x0000",
+        "from": "0xa61464658AfeAf65CccaaFD3a512b69A83B77618",
+        "gas": "0x0000",
+        "gasPrice": "0x0000",
+        "value": "0x0000",
+        "nonce": "0x0000"
+    }, "latest"]
 }
 
 ###
@@ -234,7 +297,362 @@ content-type: application/json
 
 {
     "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_syncing",
+    "params": []
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "evm_increaseTime",
+    "params": [10]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "evm_setNextBlockTimestamp",
+    "params": [1672527600]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "evm_setTime",
+    "params": [1672527600]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "evm_mine",
+    "params": []
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "evm_snapshot",
+    "params": []
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "evm_revert",
+    "params": ["0x1"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getBlockByHash",
+    "params": ["0x371c9871792d89fea30e6b947ca45e9798e4f577dcdddb79269a93450f52b459", true]
+}
+
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getBlockByNumber",
+    "params": ["0xc9d5bb", false]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getBlockByNumber",
+    "params": ["latest", false]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getBlockByNumber",
+    "params": ["earliest", false]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getBlockTransactionCountByHash",
+    "params": ["0x371c9871792d89fea30e6b947ca45e9798e4f577dcdddb79269a93450f52b459"]
+}
+
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getBlockTransactionCountByNumber",
+    "params": ["0xc9d5bb"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getBlockTransactionCountByNumber",
+    "params": ["latest"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getBlockTransactionCountByNumber",
+    "params": ["earliest"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_newBlockFilter",
+    "params": []
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_newFilter",
+    "params": [{"fromBlock": "earliest", "toBlock": "0xa"}]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_newPendingTransactionFilter",
+    "params": []
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_uninstallFilter",
+    "params": ["0x2"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getFilterChanges",
+    "params": ["0x1"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getStorageAt",
+    "params": ["0x123456789abcdef123456789abcdef1234567890", "0x0", "latest"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getTransactionByBlockHashAndIndex",
+    "params": ["0x123456789abcdef123456789abcdef1234567890", "0x1"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_getTransactionByBlockNumberAndIndex",
+    "params": ["latest", "0x1"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "eth_protocolVersion"
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "hardhat_setBalance",
+    "params": [
+        "0x36615Cf349d7F6344891B1e7CA7C72883F5dc049",
+        "0x1337"
+    ]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "hardhat_setNonce",
+    "params": [
+        "0x36615Cf349d7F6344891B1e7CA7C72883F5dc049",
+        "0x56"
+    ]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "hardhat_mine",
+    "params": [
+        "0xaa",
+        "0x100"
+    ]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "hardhat_impersonateAccount",
+    "params": [
+        "0x364d6D0333432C3Ac016Ca832fb8594A8cE43Ca6"
+    ]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "2",
+    "method": "hardhat_stopImpersonatingAccount",
+    "params": [
+        "0x364d6D0333432C3Ac016Ca832fb8594A8cE43Ca6"
+    ]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
     "id": "1",
     "method": "zks_getTokenPrice",
     "params": ["0x0000000000000000000000000000000000000000"]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "eth_feeHistory",
+    "params": ["0x1", "latest", [25, 50 , 75]]
+}
+
+###
+POST http://localhost:8011
+content-type: application/json
+
+{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "eth_accounts",
+    "params": []
 }

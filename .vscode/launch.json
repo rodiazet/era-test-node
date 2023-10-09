@@ -19,7 +19,9 @@
                     "kind": "bin"
                 }
             },
-            "args": ["run"],
+            "args": [
+                "run"
+            ],
             "cwd": "${workspaceFolder}"
         },
         {
@@ -41,9 +43,23 @@
                 "RUST_LOG": "vm=trace",
                 "ZKSYNC_HOME": "${workspaceFolder}"
             },
-            "args": ["--dev-use-local-contracts", "run"],
+            "args": [
+                "--dev-use-local-contracts",
+                "run"
+            ],
             "preLaunchTask": "rebuild-contracts",
             "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "E2E Tests",
+            "type": "node",
+            "request": "launch",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/e2e-tests",
+            "runtimeExecutable": "yarn",
+            "runtimeArgs": [
+                "test"
+            ]
         },
     ]
 }
