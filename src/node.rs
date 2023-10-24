@@ -12,6 +12,7 @@ use crate::{
         IntoBoxedFuture,
     },
 };
+use bigdecimal::num_traits::ToBytes;
 use clap::Parser;
 use colored::Colorize;
 use core::fmt::Display;
@@ -940,7 +941,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
     }
 
     /// Runs L2 'eth call' method - that doesn't commit to a block.
-    fn run_l2_call(&self, mut l2_tx: L2Tx) -> Result<ExecutionResult, String> {
+    fn run_l2_call(&self, mut l2_tx: L2Tx) -> Result<VmExecutionResultAndLogs, String> {
         let execution_mode = TxExecutionMode::EthCall;
 
         let inner = self
@@ -1004,7 +1005,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
             formatter::print_call(call, 0, &inner.show_calls, inner.resolve_hashes);
         }
 
-        Ok(tx_result.result)
+        Ok(tx_result)
     }
 
     fn display_detailed_gas_info(
@@ -1613,11 +1614,15 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
             Ok(mut tx) => {
                 tx.common_data.fee.gas_limit = ETH_CALL_GAS_LIMIT.into();
                 let result = self.run_l2_call(tx);
+                let gas_used = result.clone().unwrap().statistics.gas_used;
 
                 match result {
-                    Ok(execution_result) => match execution_result {
+                    Ok(execution_result) => match execution_result.result {
                         ExecutionResult::Success { output } => {
-                            Ok(output.into()).into_boxed_future()
+                            let mut response_bytes = vec![];
+                            response_bytes.extend_from_slice(&gas_used.to_le_bytes());
+                            response_bytes.extend_from_slice(&output);
+                            Ok(response_bytes.into()).into_boxed_future()
                         }
                         ExecutionResult::Revert { output } => {
                             let message = output.to_user_friendly_string();
