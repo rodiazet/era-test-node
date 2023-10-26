@@ -1,4 +1,4 @@
-use vm::TxExecutionMode;
+use multivm::interface::TxExecutionMode;
 use zksync_contracts::{
     read_playground_batch_bootloader_bytecode, read_proved_batch_bootloader_bytecode,
     read_sys_contract_bytecode, read_zbin_bytecode, BaseSystemContracts, ContractLanguage,
@@ -9,8 +9,10 @@ use zksync_utils::{bytecode::hash_bytecode, bytes_to_be_words};
 
 use crate::deps::system_contracts::{bytecode_from_slice, COMPILED_IN_SYSTEM_CONTRACTS};
 
+#[derive(Default, Debug, Clone)]
 pub enum Options {
     // Use the compiled-in contracts
+    #[default]
     BuiltIn,
     // Load the contracts bytecode at runtime from ZKSYNC_HOME
     Local,

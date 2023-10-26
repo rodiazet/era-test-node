@@ -1,25 +1,23 @@
 use crate::{
     fork::ForkSource,
     node::{InMemoryNodeInner, MAX_TX_SIZE},
-    utils::not_implemented,
+    utils::{create_debug_output, to_real_block_number},
 };
+use itertools::Itertools;
 use jsonrpc_core::{BoxFuture, Result};
+use multivm::vm_virtual_blocks::{constants::ETH_CALL_GAS_LIMIT, CallTracer, HistoryDisabled, Vm};
 use once_cell::sync::OnceCell;
 use std::sync::{Arc, RwLock};
-use vm::{
-    constants::ETH_CALL_GAS_LIMIT, CallTracer, ExecutionResult, HistoryDisabled, TxExecutionMode,
-    Vm,
-};
 use zksync_basic_types::H256;
 use zksync_core::api_server::web3::backend_jsonrpc::{
     error::into_jsrpc_error, namespaces::debug::DebugNamespaceT,
 };
 use zksync_state::StorageView;
 use zksync_types::{
-    api::{BlockId, BlockNumber, DebugCall, DebugCallType, ResultDebugCall, TracerConfig},
+    api::{BlockId, BlockNumber, DebugCall, ResultDebugCall, TracerConfig, TransactionVariant},
     l2::L2Tx,
     transaction_request::CallRequest,
-    PackedEthSignature, Transaction, CONTRACT_DEPLOYER_ADDRESS,
+    PackedEthSignature, Transaction, U64,
 };
 use zksync_web3_decl::error::Web3Error;
 
@@ -40,18 +38,107 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> DebugNamespaceT
 {
     fn trace_block_by_number(
         &self,
-        _block: BlockNumber,
-        _options: Option<TracerConfig>,
+        block: BlockNumber,
+        options: Option<TracerConfig>,
     ) -> BoxFuture<Result<Vec<ResultDebugCall>>> {
-        not_implemented("debug_traceBlockByNumber")
+        let only_top = options.is_some_and(|o| o.tracer_config.only_top_call);
+        let inner = Arc::clone(&self.node);
+        Box::pin(async move {
+            let inner = inner
+                .read()
+                .map_err(|_| into_jsrpc_error(Web3Error::InternalError))?;
+
+            let block = {
+                let number =
+                    to_real_block_number(block, U64::from(inner.current_miniblock)).as_u64();
+
+                inner
+                    .block_hashes
+                    .get(&number)
+                    .and_then(|hash| inner.blocks.get(hash))
+                    .ok_or_else(|| {
+                        into_jsrpc_error(Web3Error::SubmitTransactionError(
+                            "Block not found".to_string(),
+                            vec![],
+                        ))
+                    })?
+            };
+
+            let tx_hashes = block
+                .transactions
+                .iter()
+                .map(|tx| match tx {
+                    TransactionVariant::Full(tx) => tx.hash,
+                    TransactionVariant::Hash(hash) => *hash,
+                })
+                .collect_vec();
+
+            let debug_calls = tx_hashes
+                .into_iter()
+                .map(|tx_hash| {
+                    let tx = inner.tx_results.get(&tx_hash).ok_or_else(|| {
+                        into_jsrpc_error(Web3Error::SubmitTransactionError(
+                            "Transaction not found".to_string(),
+                            vec![],
+                        ))
+                    })?;
+                    Ok(tx.debug_info(only_top))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .map(|result| ResultDebugCall { result })
+                .collect_vec();
+
+            Ok(debug_calls)
+        })
     }
 
     fn trace_block_by_hash(
         &self,
-        _hash: H256,
-        _options: Option<TracerConfig>,
+        hash: H256,
+        options: Option<TracerConfig>,
     ) -> BoxFuture<Result<Vec<ResultDebugCall>>> {
-        not_implemented("debug_traceBlockByHash")
+        let only_top = options.is_some_and(|o| o.tracer_config.only_top_call);
+        let inner = Arc::clone(&self.node);
+        Box::pin(async move {
+            let inner = inner
+                .read()
+                .map_err(|_| into_jsrpc_error(Web3Error::InternalError))?;
+
+            let block = inner.blocks.get(&hash).ok_or_else(|| {
+                into_jsrpc_error(Web3Error::SubmitTransactionError(
+                    "Block not found".to_string(),
+                    vec![],
+                ))
+            })?;
+
+            let tx_hashes = block
+                .transactions
+                .iter()
+                .map(|tx| match tx {
+                    TransactionVariant::Full(tx) => tx.hash,
+                    TransactionVariant::Hash(hash) => *hash,
+                })
+                .collect_vec();
+
+            let debug_calls = tx_hashes
+                .into_iter()
+                .map(|tx_hash| {
+                    let tx = inner.tx_results.get(&tx_hash).ok_or_else(|| {
+                        into_jsrpc_error(Web3Error::SubmitTransactionError(
+                            "Transaction not found".to_string(),
+                            vec![],
+                        ))
+                    })?;
+                    Ok(tx.debug_info(only_top))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .map(|result| ResultDebugCall { result })
+                .collect_vec();
+
+            Ok(debug_calls)
+        })
     }
 
     /// Trace execution of a transaction.
@@ -82,7 +169,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> DebugNamespaceT
                 }
             };
 
-            let execution_mode = TxExecutionMode::EthCall;
+            let execution_mode = multivm::interface::TxExecutionMode::EthCall;
             let storage = StorageView::new(&inner.fork_storage).to_rc_ptr();
 
             let bootloader_code = inner.system_contracts.contracts_for_l2_call();
@@ -111,7 +198,10 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> DebugNamespaceT
 
             let call_tracer_result = Arc::new(OnceCell::default());
             let tracer = CallTracer::new(call_tracer_result.clone(), HistoryDisabled);
-            let tx_result = vm.inspect(vec![Box::new(tracer)], vm::VmExecutionMode::OneTx);
+            let tx_result = vm.inspect(
+                vec![Box::new(tracer)],
+                multivm::interface::VmExecutionMode::OneTx,
+            );
 
             let call_traces = if only_top {
                 vec![]
@@ -122,57 +212,30 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> DebugNamespaceT
                     .unwrap_or_default()
             };
 
-            let calltype = if l2_tx.recipient_account() == CONTRACT_DEPLOYER_ADDRESS {
-                DebugCallType::Create
-            } else {
-                DebugCallType::Call
-            };
+            let debug =
+                create_debug_output(&l2_tx, &tx_result, call_traces).map_err(into_jsrpc_error)?;
 
-            let result = match &tx_result.result {
-                ExecutionResult::Success { output } => DebugCall {
-                    gas_used: tx_result.statistics.gas_used.into(),
-                    output: output.clone().into(),
-                    r#type: calltype,
-                    from: l2_tx.initiator_account(),
-                    to: l2_tx.recipient_account(),
-                    gas: l2_tx.common_data.fee.gas_limit,
-                    value: l2_tx.execute.value,
-                    input: l2_tx.execute.calldata().into(),
-                    error: None,
-                    revert_reason: None,
-                    calls: call_traces.into_iter().map(Into::into).collect(),
-                },
-                ExecutionResult::Revert { output } => DebugCall {
-                    gas_used: tx_result.statistics.gas_used.into(),
-                    output: Default::default(),
-                    r#type: calltype,
-                    from: l2_tx.initiator_account(),
-                    to: l2_tx.recipient_account(),
-                    gas: l2_tx.common_data.fee.gas_limit,
-                    value: l2_tx.execute.value,
-                    input: l2_tx.execute.calldata().into(),
-                    error: None,
-                    revert_reason: Some(output.to_string()),
-                    calls: call_traces.into_iter().map(Into::into).collect(),
-                },
-                ExecutionResult::Halt { reason } => {
-                    return Err(into_jsrpc_error(Web3Error::SubmitTransactionError(
-                        reason.to_string(),
-                        vec![],
-                    )))
-                }
-            };
-
-            Ok(result)
+            Ok(debug)
         })
     }
 
     fn trace_transaction(
         &self,
-        _tx_hash: H256,
-        _options: Option<TracerConfig>,
+        tx_hash: H256,
+        options: Option<TracerConfig>,
     ) -> BoxFuture<Result<Option<DebugCall>>> {
-        not_implemented("debug_traceTransaction")
+        let only_top = options.is_some_and(|o| o.tracer_config.only_top_call);
+        let inner = Arc::clone(&self.node);
+        Box::pin(async move {
+            let inner = inner
+                .read()
+                .map_err(|_| into_jsrpc_error(Web3Error::InternalError))?;
+
+            Ok(inner
+                .tx_results
+                .get(&tx_hash)
+                .map(|tx| tx.debug_info(only_top)))
+        })
     }
 }
 
@@ -180,13 +243,15 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> DebugNamespaceT
 mod tests {
     use super::*;
     use crate::{
-        deps::system_contracts::bytecode_from_slice, http_fork_source::HttpForkSource,
-        node::InMemoryNode, testing,
+        deps::system_contracts::bytecode_from_slice,
+        http_fork_source::HttpForkSource,
+        node::{InMemoryNode, TransactionResult},
+        testing::{self, LogBuilder},
     };
     use ethers::abi::{short_signature, AbiEncode, HumanReadableParser, ParamType, Token};
-    use zksync_basic_types::{Address, Nonce, U256};
+    use zksync_basic_types::{Address, Nonce, H160, U256};
     use zksync_types::{
-        api::{CallTracerConfig, SupportedTracers},
+        api::{Block, CallTracerConfig, SupportedTracers, TransactionReceipt},
         transaction_request::CallRequestBuilder,
         utils::deployed_address_create,
     };
@@ -353,5 +418,162 @@ mod tests {
 
         // the contract subcall should have reverted
         assert!(contract_call.revert_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_trace_transaction() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+        {
+            let mut writer = inner.write().unwrap();
+            writer.tx_results.insert(
+                H256::repeat_byte(0x1),
+                TransactionResult {
+                    info: testing::default_tx_execution_info(),
+                    receipt: TransactionReceipt {
+                        logs: vec![LogBuilder::new()
+                            .set_address(H160::repeat_byte(0xa1))
+                            .build()],
+                        ..Default::default()
+                    },
+                    debug: testing::default_tx_debug_info(),
+                },
+            );
+        }
+        let result = DebugNamespaceImpl::new(inner)
+            .trace_transaction(H256::repeat_byte(0x1), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_trace_transaction_only_top() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+        {
+            let mut writer = inner.write().unwrap();
+            writer.tx_results.insert(
+                H256::repeat_byte(0x1),
+                TransactionResult {
+                    info: testing::default_tx_execution_info(),
+                    receipt: TransactionReceipt {
+                        logs: vec![LogBuilder::new()
+                            .set_address(H160::repeat_byte(0xa1))
+                            .build()],
+                        ..Default::default()
+                    },
+                    debug: testing::default_tx_debug_info(),
+                },
+            );
+        }
+        let result = DebugNamespaceImpl::new(inner)
+            .trace_transaction(
+                H256::repeat_byte(0x1),
+                Some(TracerConfig {
+                    tracer: SupportedTracers::CallTracer,
+                    tracer_config: CallTracerConfig {
+                        only_top_call: true,
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_trace_transaction_not_found() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+        let result = DebugNamespaceImpl::new(inner)
+            .trace_transaction(H256::repeat_byte(0x1), None)
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_trace_block_by_hash_empty() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+        {
+            let mut writer = inner.write().unwrap();
+            let block = Block::<TransactionVariant>::default();
+            writer.blocks.insert(H256::repeat_byte(0x1), block);
+        }
+        let result = DebugNamespaceImpl::new(inner)
+            .trace_block_by_hash(H256::repeat_byte(0x1), None)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_trace_block_by_hash() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+        {
+            let mut writer = inner.write().unwrap();
+            let tx = zksync_types::api::Transaction::default();
+            let tx_hash = tx.hash;
+            let mut block = Block::<TransactionVariant>::default();
+            block.transactions.push(TransactionVariant::Full(tx));
+            writer.blocks.insert(H256::repeat_byte(0x1), block);
+            writer.tx_results.insert(
+                tx_hash,
+                TransactionResult {
+                    info: testing::default_tx_execution_info(),
+                    receipt: TransactionReceipt::default(),
+                    debug: testing::default_tx_debug_info(),
+                },
+            );
+        }
+        let result = DebugNamespaceImpl::new(inner)
+            .trace_block_by_hash(H256::repeat_byte(0x1), None)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].result.calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_trace_block_by_number() {
+        let node = InMemoryNode::<HttpForkSource>::default();
+        let inner = node.get_inner();
+        {
+            let mut writer = inner.write().unwrap();
+            let tx = zksync_types::api::Transaction::default();
+            let tx_hash = tx.hash;
+            let mut block = Block::<TransactionVariant>::default();
+            block.transactions.push(TransactionVariant::Full(tx));
+            writer.blocks.insert(H256::repeat_byte(0x1), block);
+            writer.block_hashes.insert(0, H256::repeat_byte(0x1));
+            writer.tx_results.insert(
+                tx_hash,
+                TransactionResult {
+                    info: testing::default_tx_execution_info(),
+                    receipt: TransactionReceipt::default(),
+                    debug: testing::default_tx_debug_info(),
+                },
+            );
+        }
+        // check `latest` alias
+        let result = DebugNamespaceImpl::new(node.get_inner())
+            .trace_block_by_number(BlockNumber::Latest, None)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].result.calls.len(), 1);
+
+        // check block number
+        let result = DebugNamespaceImpl::new(node.get_inner())
+            .trace_block_by_number(BlockNumber::Number(0.into()), None)
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].result.calls.len(), 1);
     }
 }

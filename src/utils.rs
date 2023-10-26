@@ -1,18 +1,22 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 
+use chrono::{DateTime, Utc};
 use futures::Future;
-use vm::{HistoryDisabled, Vm};
+use multivm::interface::{ExecutionResult, VmExecutionResultAndLogs};
+use multivm::vm_latest::{utils::fee::derive_base_fee_and_gas_per_pubdata, HistoryDisabled, Vm};
 use zksync_basic_types::{U256, U64};
 use zksync_state::StorageView;
 use zksync_state::WriteStorage;
-use zksync_types::api::BlockNumber;
+use zksync_types::api::{BlockNumber, DebugCall, DebugCallType};
+use zksync_types::l2::L2Tx;
+use zksync_types::vm_trace::Call;
+use zksync_types::CONTRACT_DEPLOYER_ADDRESS;
 use zksync_utils::u256_to_h256;
+use zksync_web3_decl::error::Web3Error;
 
 use crate::node::create_empty_block;
 use crate::{fork::ForkSource, node::InMemoryNodeInner};
-use vm::utils::fee::derive_base_fee_and_gas_per_pubdata;
-
 use zksync_utils::{bytecode::hash_bytecode, bytes_to_be_words};
 
 pub(crate) trait IntoBoxedFuture: Sized + Send + 'static {
@@ -113,12 +117,14 @@ pub fn mine_empty_blocks<S: std::fmt::Debug + ForkSource>(
             }
 
             // init vm
-            let system_env =
-                node.create_system_env(bootloader_code.clone(), vm::TxExecutionMode::VerifyExecute);
+            let system_env = node.create_system_env(
+                bootloader_code.clone(),
+                multivm::interface::TxExecutionMode::VerifyExecute,
+            );
 
             let mut vm = Vm::new(batch_env, system_env, storage.clone(), HistoryDisabled);
 
-            vm.execute(vm::VmExecutionMode::Bootloader);
+            vm.execute(multivm::interface::VmExecutionMode::Bootloader);
 
             let bytecodes: HashMap<U256, Vec<U256>> = vm
                 .get_last_tx_compressed_bytecodes()
@@ -184,13 +190,66 @@ pub fn to_real_block_number(block_number: BlockNumber, latest_block_number: U64)
 pub fn not_implemented<T: Send + 'static>(
     method_name: &str,
 ) -> jsonrpc_core::BoxFuture<Result<T, jsonrpc_core::Error>> {
-    log::warn!("Method {} is not implemented", method_name);
+    tracing::warn!("Method {} is not implemented", method_name);
     Err(jsonrpc_core::Error {
         data: None,
         code: jsonrpc_core::ErrorCode::MethodNotFound,
         message: format!("Method {} is not implemented", method_name),
     })
     .into_boxed_future()
+}
+
+/// Creates a [DebugCall] from a [L2Tx], [VmExecutionResultAndLogs] and a list of [Call]s.
+pub fn create_debug_output(
+    l2_tx: &L2Tx,
+    result: &VmExecutionResultAndLogs,
+    traces: Vec<Call>,
+) -> Result<DebugCall, Web3Error> {
+    let calltype = if l2_tx.recipient_account() == CONTRACT_DEPLOYER_ADDRESS {
+        DebugCallType::Create
+    } else {
+        DebugCallType::Call
+    };
+    match &result.result {
+        ExecutionResult::Success { output } => Ok(DebugCall {
+            gas_used: result.statistics.gas_used.into(),
+            output: output.clone().into(),
+            r#type: calltype,
+            from: l2_tx.initiator_account(),
+            to: l2_tx.recipient_account(),
+            gas: l2_tx.common_data.fee.gas_limit,
+            value: l2_tx.execute.value,
+            input: l2_tx.execute.calldata().into(),
+            error: None,
+            revert_reason: None,
+            calls: traces.into_iter().map(Into::into).collect(),
+        }),
+        ExecutionResult::Revert { output } => Ok(DebugCall {
+            gas_used: result.statistics.gas_used.into(),
+            output: Default::default(),
+            r#type: calltype,
+            from: l2_tx.initiator_account(),
+            to: l2_tx.recipient_account(),
+            gas: l2_tx.common_data.fee.gas_limit,
+            value: l2_tx.execute.value,
+            input: l2_tx.execute.calldata().into(),
+            error: None,
+            revert_reason: Some(output.to_string()),
+            calls: traces.into_iter().map(Into::into).collect(),
+        }),
+        ExecutionResult::Halt { reason } => Err(Web3Error::SubmitTransactionError(
+            reason.to_string(),
+            vec![],
+        )),
+    }
+}
+
+/// Converts a timestamp in milliseconds since epoch to a [DateTime] in UTC.
+pub fn utc_datetime_from_epoch_ms(millis: u64) -> DateTime<Utc> {
+    let secs = millis / 1000;
+    let nanos = (millis % 1000) * 1_000_000;
+    // expect() is ok- nanos can't be >2M
+    DateTime::<Utc>::from_timestamp(secs as i64, nanos as u32).expect("valid timestamp")
 }
 
 #[cfg(test)]
@@ -200,6 +259,18 @@ mod tests {
     use crate::{http_fork_source::HttpForkSource, node::InMemoryNode, testing};
 
     use super::*;
+
+    #[test]
+    fn test_utc_datetime_from_epoch_ms() {
+        let actual = utc_datetime_from_epoch_ms(1623931200000);
+        assert_eq!(
+            DateTime::<Utc>::from_naive_utc_and_offset(
+                chrono::NaiveDateTime::from_timestamp_opt(1623931200, 0).unwrap(),
+                Utc
+            ),
+            actual
+        );
+    }
 
     #[test]
     fn test_human_sizes() {

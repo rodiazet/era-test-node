@@ -4,10 +4,11 @@ import * as hre from "hardhat";
 import { Deployer } from "@matterlabs/hardhat-zksync-deploy";
 import { RichAccounts } from "../helpers/constants";
 import { deployContract, expectThrowsAsync, getTestProvider } from "../helpers/utils";
+import { BigNumber } from "ethers";
 
 const provider = getTestProvider();
 
-describe("debug namespace", function () {
+describe("debug_traceCall", function () {
   it("Should return error if block is not 'latest' or unspecified", async function () {
     expectThrowsAsync(async () => {
       await provider.send("debug_traceCall", [{ to: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266" }, "earliest"]);
@@ -71,5 +72,96 @@ describe("debug namespace", function () {
 
     const [output_number] = primary.interface.decodeFunctionResult("calculate", output);
     expect(output_number.toNumber()).to.equal(12);
+  });
+});
+
+describe("debug_traceTransaction", function () {
+  it("Should return null if txn hash is unknown", async function () {
+    const result = await provider.send("debug_traceTransaction", [
+      "0xd3a94ff697a573cb174ecce05126e952ecea6dee051526a3e389747ff86b0d99",
+    ]);
+    expect(result).to.equal(null);
+  });
+
+  it("Should trace prior transactions", async function () {
+    const wallet = new Wallet(RichAccounts[0].PrivateKey);
+    const deployer = new Deployer(hre, wallet);
+
+    const greeter = await deployContract(deployer, "Greeter", ["Hi"]);
+
+    const txReceipt = await greeter.setGreeting("Luke Skywalker");
+    const trace = await provider.send("debug_traceTransaction", [txReceipt.hash]);
+
+    // call should be successful
+    expect(trace.error).to.equal(null);
+    expect(trace.calls.length).to.equal(1);
+
+    // gas limit should match
+    expect(BigNumber.from(trace.gas).toNumber()).to.equal(txReceipt.gasLimit.toNumber());
+  });
+
+  it("Should respect only_top_calls option", async function () {
+    const wallet = new Wallet(RichAccounts[0].PrivateKey);
+    const deployer = new Deployer(hre, wallet);
+
+    const greeter = await deployContract(deployer, "Greeter", ["Hi"]);
+
+    const txReceipt = await greeter.setGreeting("Luke Skywalker");
+    const trace = await provider.send("debug_traceTransaction", [
+      txReceipt.hash,
+      { tracer: "callTracer", tracerConfig: { onlyTopCall: true } },
+    ]);
+
+    // call should be successful
+    expect(trace.error).to.equal(null);
+    expect(trace.calls.length).to.equal(0);
+  });
+});
+
+describe("debug_traceBlockByHash", function () {
+  it("Should trace prior blocks", async function () {
+    const wallet = new Wallet(RichAccounts[0].PrivateKey);
+    const deployer = new Deployer(hre, wallet);
+
+    const greeter = await deployContract(deployer, "Greeter", ["Hi"]);
+
+    const txReceipt = await greeter.setGreeting("Luke Skywalker");
+    const latestBlock = await provider.getBlock("latest");
+    const block = await provider.getBlock(latestBlock.number - 1);
+
+    const traces = await provider.send("debug_traceBlockByHash", [block.hash]);
+
+    // block should have 1 traces
+    expect(traces.length).to.equal(1);
+
+    // should contain trace for our tx
+    const trace = traces[0].result;
+    expect(trace.input).to.equal(txReceipt.data);
+  });
+});
+
+describe("debug_traceBlockByNumber", function () {
+  it("Should trace prior blocks", async function () {
+    const wallet = new Wallet(RichAccounts[0].PrivateKey);
+    const deployer = new Deployer(hre, wallet);
+
+    const greeter = await deployContract(deployer, "Greeter", ["Hi"]);
+
+    const txReceipt = await greeter.setGreeting("Luke Skywalker");
+
+    // latest block will be empty, check we get no traces for it
+    const empty_traces = await provider.send("debug_traceBlockByNumber", ["latest"]);
+    expect(empty_traces.length).to.equal(0);
+
+    // latest - 1 should contain our traces
+    const latestBlock = await provider.getBlock("latest");
+    const traces = await provider.send("debug_traceBlockByNumber", [(latestBlock.number - 1).toString(16)]);
+
+    // block should have 1 traces
+    expect(traces.length).to.equal(1);
+
+    // should contain trace for our tx
+    const trace = traces[0].result;
+    expect(trace.input).to.equal(txReceipt.data);
   });
 });

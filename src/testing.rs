@@ -15,10 +15,10 @@ use httptest::{
     Expectation, Server,
 };
 use itertools::Itertools;
+use multivm::interface::{ExecutionResult, VmExecutionResultAndLogs};
 use std::str::FromStr;
-use vm::VmExecutionResultAndLogs;
 use zksync_basic_types::{H160, U64};
-use zksync_types::api::Log;
+use zksync_types::api::{BridgeAddresses, DebugCall, DebugCallType, Log};
 use zksync_types::{
     fee::Fee, l2::L2Tx, Address, L2ChainId, Nonce, PackedEthSignature, ProtocolVersionId, H256,
     U256,
@@ -95,7 +95,7 @@ impl MockServer {
                       "default_aa": "0x0100038dc66b69be75ec31653c64cb931678299b9b659472772b2550b703f41c"
                     },
                     "operatorAddress": "0xfeee860e7aae671124e9a4e61139f3a5085dfeee",
-                    "protocolVersion": ProtocolVersionId::latest(),
+                    "protocolVersion": ProtocolVersionId::Version15,
                   },
             }))),
         );
@@ -275,7 +275,7 @@ impl TransactionResponseBuilder {
             "type": "0xff",
             "maxFeePerGas": "0x0",
             "maxPriorityFeePerGas": "0x0",
-            "chainId": "0x144",
+            "chainId": "0x104",
             "l1BatchNumber": "0x1",
             "l1BatchTxIndex": "0x0",
         })
@@ -384,7 +384,7 @@ pub fn apply_tx<T: ForkSource + std::fmt::Debug>(
             gas_per_pubdata_limit: U256::from(20000),
         },
         U256::from(1),
-        L2ChainId(260),
+        L2ChainId::from(260),
         &private_key,
         None,
         Default::default(),
@@ -466,7 +466,7 @@ pub fn deploy_contract<T: ForkSource + std::fmt::Debug>(
             gas_per_pubdata_limit: U256::from(50000),
         },
         U256::from(0),
-        zksync_basic_types::L2ChainId(260),
+        zksync_basic_types::L2ChainId::from(260),
         &private_key,
         Some(vec![bytecode]),
         Default::default(),
@@ -562,12 +562,64 @@ pub fn default_tx_execution_info() -> TxExecutionInfo {
         batch_number: Default::default(),
         miniblock_number: Default::default(),
         result: VmExecutionResultAndLogs {
-            result: vm::ExecutionResult::Success { output: vec![] },
+            result: ExecutionResult::Success { output: vec![] },
             logs: Default::default(),
             statistics: Default::default(),
             refunds: Default::default(),
         },
     }
+}
+
+/// Returns a default instance for a successful [DebugCall]
+pub fn default_tx_debug_info() -> DebugCall {
+    DebugCall {
+        r#type: DebugCallType::Call,
+        from: Address::zero(),
+        to: Address::zero(),
+        gas: U256::zero(),
+        gas_used: U256::zero(),
+        value: U256::zero(),
+        output: Default::default(),
+        input: Default::default(),
+        error: None,
+        revert_reason: None,
+        calls: vec![DebugCall {
+            r#type: DebugCallType::Call,
+            from: Address::zero(),
+            to: Address::zero(),
+            gas: U256::zero(),
+            gas_used: U256::zero(),
+            value: U256::zero(),
+            output: Default::default(),
+            input: Default::default(),
+            error: None,
+            revert_reason: None,
+            calls: vec![],
+        }],
+    }
+}
+
+/// Asserts that two instances of [BridgeAddresses] are equal
+pub fn assert_bridge_addresses_eq(
+    expected_bridge_addresses: &BridgeAddresses,
+    actual_bridge_addresses: &BridgeAddresses,
+) {
+    assert_eq!(
+        expected_bridge_addresses.l1_erc20_default_bridge,
+        actual_bridge_addresses.l1_erc20_default_bridge
+    );
+    assert_eq!(
+        expected_bridge_addresses.l2_erc20_default_bridge,
+        actual_bridge_addresses.l2_erc20_default_bridge
+    );
+    assert_eq!(
+        expected_bridge_addresses.l1_weth_bridge,
+        actual_bridge_addresses.l1_weth_bridge
+    );
+    assert_eq!(
+        expected_bridge_addresses.l2_weth_bridge,
+        actual_bridge_addresses.l2_weth_bridge
+    );
 }
 
 mod test {

@@ -6,10 +6,11 @@ use crate::{
     filters::{EthFilters, FilterType, LogFilter},
     fork::{ForkDetails, ForkSource, ForkStorage},
     formatter,
+    observability::Observability,
     system_contracts::{self, Options, SystemContracts},
     utils::{
-        self, adjust_l1_gas_price_for_tx, bytecode_to_factory_dep, not_implemented, to_human_size,
-        IntoBoxedFuture,
+        self, adjust_l1_gas_price_for_tx, bytecode_to_factory_dep, create_debug_output,
+        not_implemented, to_human_size, IntoBoxedFuture,
     },
 };
 use bigdecimal::num_traits::ToBytes;
@@ -28,7 +29,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use vm::{
+use multivm::interface::{
+    ExecutionResult, L1BatchEnv, L2BlockEnv, SystemEnv, TxExecutionMode, VmExecutionMode,
+    VmExecutionResultAndLogs,
+};
+use multivm::vm_virtual_blocks::{
     constants::{
         BLOCK_GAS_LIMIT, BLOCK_OVERHEAD_PUBDATA, ETH_CALL_GAS_LIMIT, MAX_PUBDATA_PER_BLOCK,
     },
@@ -37,8 +42,7 @@ use vm::{
         l2_blocks::load_last_l2_block,
         overhead::{derive_overhead, OverheadCoeficients},
     },
-    CallTracer, ExecutionResult, HistoryDisabled, L1BatchEnv, SystemEnv, TxExecutionMode, Vm,
-    VmExecutionResultAndLogs, VmTracer,
+    CallTracer, HistoryDisabled, Vm, VmTracer,
 };
 use zksync_basic_types::{
     web3::{self, signing::keccak256},
@@ -50,16 +54,18 @@ use zksync_core::api_server::web3::backend_jsonrpc::{
 };
 use zksync_state::{ReadStorage, StoragePtr, StorageView, WriteStorage};
 use zksync_types::{
-    api::{Block, Log, TransactionReceipt, TransactionVariant},
+    api::{Block, DebugCall, Log, TransactionReceipt, TransactionVariant},
     block::legacy_miniblock_hash,
     fee::Fee,
     get_code_key, get_nonce_key,
     l2::L2Tx,
+    l2::TransactionType,
     transaction_request::TransactionRequest,
     utils::{
         decompose_full_nonce, nonces_to_full_nonce, storage_key_for_eth_balance,
         storage_key_for_standard_token_balance,
     },
+    vm_trace::Call,
     PackedEthSignature, StorageKey, StorageLogQueryType, StorageValue, Transaction,
     ACCOUNT_CODE_STORAGE_ADDRESS, EIP_712_TX_TYPE, L2_ETH_TOKEN_ADDRESS, MAX_GAS_PER_PUBDATA_BYTE,
     MAX_L2_TX_GAS_LIMIT,
@@ -78,7 +84,7 @@ pub const MAX_TX_SIZE: usize = 1_000_000;
 /// Timestamp of the first block (if not running in fork mode).
 pub const NON_FORK_FIRST_BLOCK_TIMESTAMP: u64 = 1_000;
 /// Network ID we use for the test node.
-pub const TEST_NODE_NETWORK_ID: u16 = 260;
+pub const TEST_NODE_NETWORK_ID: u32 = 260;
 /// L1 Gas Price.
 pub const L1_GAS_PRICE: u64 = 50_000_000_000;
 /// L2 Gas Price (0.25 gwei).
@@ -125,8 +131,9 @@ pub struct TxExecutionInfo {
     pub result: VmExecutionResultAndLogs,
 }
 
-#[derive(Debug, clap::Parser, Clone, clap::ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Default, clap::Parser, Clone, clap::ValueEnum, PartialEq, Eq)]
 pub enum ShowCalls {
+    #[default]
     None,
     User,
     System,
@@ -156,8 +163,9 @@ impl Display for ShowCalls {
     }
 }
 
-#[derive(Debug, Parser, Clone, clap::ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Default, Parser, Clone, clap::ValueEnum, PartialEq, Eq)]
 pub enum ShowStorageLogs {
+    #[default]
     None,
     Read,
     Write,
@@ -187,8 +195,9 @@ impl Display for ShowStorageLogs {
     }
 }
 
-#[derive(Debug, Parser, Clone, clap::ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Default, Parser, Clone, clap::ValueEnum, PartialEq, Eq)]
 pub enum ShowVMDetails {
+    #[default]
     None,
     All,
 }
@@ -214,8 +223,9 @@ impl Display for ShowVMDetails {
     }
 }
 
-#[derive(Debug, Parser, Clone, clap::ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Default, Parser, Clone, clap::ValueEnum, PartialEq, Eq)]
 pub enum ShowGasDetails {
+    #[default]
     None,
     All,
 }
@@ -243,8 +253,25 @@ impl Display for ShowGasDetails {
 
 #[derive(Debug, Clone)]
 pub struct TransactionResult {
-    info: TxExecutionInfo,
-    receipt: TransactionReceipt,
+    pub info: TxExecutionInfo,
+    pub receipt: TransactionReceipt,
+    pub debug: DebugCall,
+}
+
+impl TransactionResult {
+    /// Returns the debug information for the transaction.
+    /// If `only_top` is true - will only return the top level call.
+    pub fn debug_info(&self, only_top: bool) -> DebugCall {
+        let calls = if only_top {
+            vec![]
+        } else {
+            self.debug.calls.clone()
+        };
+        DebugCall {
+            calls,
+            ..self.debug.clone()
+        }
+    }
 }
 
 /// Helper struct for InMemoryNode.
@@ -289,11 +316,14 @@ pub struct InMemoryNodeInner<S> {
     pub rich_accounts: HashSet<H160>,
     /// Keeps track of historical states indexed via block hash. Limited to [MAX_PREVIOUS_STATES].
     pub previous_states: IndexMap<H256, HashMap<StorageKey, StorageValue>>,
+    /// An optional handle to the observability stack
+    pub observability: Option<Observability>,
 }
 
 type L2TxResult = (
     HashMap<StorageKey, H256>,
     VmExecutionResultAndLogs,
+    Vec<Call>,
     Block<TransactionVariant>,
     HashMap<U256, Vec<U256>>,
     BlockContext,
@@ -326,7 +356,7 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
             fair_l2_gas_price: L2_GAS_PRICE,
             fee_account: H160::zero(),
             enforced_base_fee: None,
-            first_l2_block: vm::L2BlockEnv {
+            first_l2_block: L2BlockEnv {
                 // the 'current_miniblock' contains the block that was already produced.
                 // So the next one should be one higher.
                 number: block_ctx.miniblock as u32,
@@ -376,13 +406,26 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
         &self,
         req: zksync_types::transaction_request::CallRequest,
     ) -> jsonrpc_core::Result<Fee> {
-        let mut l2_tx = match L2Tx::from_request(req.into(), MAX_TX_SIZE) {
-            Ok(tx) => tx,
-            Err(e) => {
-                let error = Web3Error::SerializationError(e);
-                return Err(into_jsrpc_error(error));
+        let mut request_with_gas_per_pubdata_overridden = req;
+
+        if let Some(ref mut eip712_meta) = request_with_gas_per_pubdata_overridden.eip712_meta {
+            if eip712_meta.gas_per_pubdata == U256::zero() {
+                eip712_meta.gas_per_pubdata = MAX_GAS_PER_PUBDATA_BYTE.into();
             }
-        };
+        }
+
+        let is_eip712 = request_with_gas_per_pubdata_overridden
+            .eip712_meta
+            .is_some();
+
+        let mut l2_tx =
+            match L2Tx::from_request(request_with_gas_per_pubdata_overridden.into(), MAX_TX_SIZE) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    let error = Web3Error::SerializationError(e);
+                    return Err(into_jsrpc_error(error));
+                }
+            };
 
         let tx: Transaction = l2_tx.clone().into();
         let fair_l2_gas_price = L2_GAS_PRICE;
@@ -408,6 +451,12 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
         if l2_tx.common_data.signature.is_empty() {
             l2_tx.common_data.signature = vec![0u8; 65];
             l2_tx.common_data.signature[64] = 27;
+        }
+
+        // The user may not include the proper transaction type during the estimation of
+        // the gas fee. However, it is needed for the bootloader checks to pass properly.
+        if is_eip712 {
+            l2_tx.common_data.transaction_type = TransactionType::EIP712Transaction;
         }
 
         l2_tx.common_data.fee.gas_per_pubdata_limit = MAX_GAS_PER_PUBDATA_BYTE.into();
@@ -462,10 +511,10 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
         let mut upper_bound = MAX_L2_TX_GAS_LIMIT as u32;
         let mut attempt_count = 1;
 
-        log::trace!("Starting gas estimation loop");
+        tracing::trace!("Starting gas estimation loop");
         while lower_bound + ESTIMATE_GAS_ACCEPTABLE_OVERESTIMATION < upper_bound {
             let mid = (lower_bound + upper_bound) / 2;
-            log::trace!(
+            tracing::trace!(
                 "Attempt {} (lower_bound: {}, upper_bound: {}, mid: {})",
                 attempt_count,
                 lower_bound,
@@ -485,19 +534,19 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
             );
 
             if estimate_gas_result.result.is_failed() {
-                log::trace!("Attempt {} FAILED", attempt_count);
+                tracing::trace!("Attempt {} FAILED", attempt_count);
                 lower_bound = mid + 1;
             } else {
-                log::trace!("Attempt {} SUCCEEDED", attempt_count);
+                tracing::trace!("Attempt {} SUCCEEDED", attempt_count);
                 upper_bound = mid;
             }
             attempt_count += 1;
         }
 
-        log::trace!("Gas Estimation Values:");
-        log::trace!("  Final upper_bound: {}", upper_bound);
-        log::trace!("  ESTIMATE_GAS_SCALE_FACTOR: {}", ESTIMATE_GAS_SCALE_FACTOR);
-        log::trace!("  MAX_L2_TX_GAS_LIMIT: {}", MAX_L2_TX_GAS_LIMIT);
+        tracing::trace!("Gas Estimation Values:");
+        tracing::trace!("  Final upper_bound: {}", upper_bound);
+        tracing::trace!("  ESTIMATE_GAS_SCALE_FACTOR: {}", ESTIMATE_GAS_SCALE_FACTOR);
+        tracing::trace!("  MAX_L2_TX_GAS_LIMIT: {}", MAX_L2_TX_GAS_LIMIT);
         let tx_body_gas_limit = cmp::min(
             MAX_L2_TX_GAS_LIMIT as u32,
             (upper_bound as f32 * ESTIMATE_GAS_SCALE_FACTOR) as u32,
@@ -524,8 +573,8 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
 
         match estimate_gas_result.result {
             ExecutionResult::Revert { output } => {
-                log::info!("{}", format!("Unable to estimate gas for the request with our suggested gas limit of {}. The transaction is most likely unexecutable. Breakdown of estimation:", suggested_gas_limit + overhead).red());
-                log::info!(
+                tracing::info!("{}", format!("Unable to estimate gas for the request with our suggested gas limit of {}. The transaction is most likely unexecutable. Breakdown of estimation:", suggested_gas_limit + overhead).red());
+                tracing::info!(
                     "{}",
                     format!(
                         "\tEstimated transaction body gas cost: {}",
@@ -533,11 +582,11 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
                     )
                     .red()
                 );
-                log::info!(
+                tracing::info!(
                     "{}",
                     format!("\tGas for pubdata: {}", gas_for_bytecodes_pubdata).red()
                 );
-                log::info!("{}", format!("\tOverhead: {}", overhead).red());
+                tracing::info!("{}", format!("\tOverhead: {}", overhead).red());
                 let message = output.to_string();
                 let pretty_message = format!(
                     "execution reverted{}{}",
@@ -545,15 +594,15 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
                     message
                 );
                 let data = output.encoded_data();
-                log::info!("{}", pretty_message.on_red());
+                tracing::info!("{}", pretty_message.on_red());
                 Err(into_jsrpc_error(Web3Error::SubmitTransactionError(
                     pretty_message,
                     data,
                 )))
             }
             ExecutionResult::Halt { reason } => {
-                log::info!("{}", format!("Unable to estimate gas for the request with our suggested gas limit of {}. The transaction is most likely unexecutable. Breakdown of estimation:", suggested_gas_limit + overhead).red());
-                log::info!(
+                tracing::info!("{}", format!("Unable to estimate gas for the request with our suggested gas limit of {}. The transaction is most likely unexecutable. Breakdown of estimation:", suggested_gas_limit + overhead).red());
+                tracing::info!(
                     "{}",
                     format!(
                         "\tEstimated transaction body gas cost: {}",
@@ -561,11 +610,11 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
                     )
                     .red()
                 );
-                log::info!(
+                tracing::info!(
                     "{}",
                     format!("\tGas for pubdata: {}", gas_for_bytecodes_pubdata).red()
                 );
-                log::info!("{}", format!("\tOverhead: {}", overhead).red());
+                tracing::info!("{}", format!("\tOverhead: {}", overhead).red());
                 let message = reason.to_string();
                 let pretty_message = format!(
                     "execution reverted{}{}",
@@ -573,7 +622,7 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
                     message
                 );
 
-                log::info!("{}", pretty_message.on_red());
+                tracing::info!("{}", pretty_message.on_red());
                 Err(into_jsrpc_error(Web3Error::SubmitTransactionError(
                     pretty_message,
                     vec![],
@@ -585,8 +634,8 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
                 {
                     (value, false) => value,
                     (_, true) => {
-                        log::info!("{}", "Overflow when calculating gas estimation. We've exceeded the block gas limit by summing the following values:".red());
-                        log::info!(
+                        tracing::info!("{}", "Overflow when calculating gas estimation. We've exceeded the block gas limit by summing the following values:".red());
+                        tracing::info!(
                             "{}",
                             format!(
                                 "\tEstimated transaction body gas cost: {}",
@@ -594,11 +643,11 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
                             )
                             .red()
                         );
-                        log::info!(
+                        tracing::info!(
                             "{}",
                             format!("\tGas for pubdata: {}", gas_for_bytecodes_pubdata).red()
                         );
-                        log::info!("{}", format!("\tOverhead: {}", overhead).red());
+                        tracing::info!("{}", format!("\tOverhead: {}", overhead).red());
                         return Err(into_jsrpc_error(Web3Error::SubmitTransactionError(
                             "exceeds block gas limit".into(),
                             Default::default(),
@@ -606,11 +655,11 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
                     }
                 };
 
-                log::trace!("Gas Estimation Results");
-                log::trace!("  tx_body_gas_limit: {}", tx_body_gas_limit);
-                log::trace!("  gas_for_bytecodes_pubdata: {}", gas_for_bytecodes_pubdata);
-                log::trace!("  overhead: {}", overhead);
-                log::trace!("  full_gas_limit: {}", full_gas_limit);
+                tracing::trace!("Gas Estimation Results");
+                tracing::trace!("  tx_body_gas_limit: {}", tx_body_gas_limit);
+                tracing::trace!("  gas_for_bytecodes_pubdata: {}", gas_for_bytecodes_pubdata);
+                tracing::trace!("  overhead: {}", overhead);
+                tracing::trace!("  full_gas_limit: {}", full_gas_limit);
                 let fee = Fee {
                     max_fee_per_gas: base_fee.into(),
                     max_priority_fee_per_gas: 0u32.into(),
@@ -677,7 +726,7 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
         let tx: Transaction = l2_tx.into();
         vm.push_transaction(tx);
 
-        vm.execute(vm::VmExecutionMode::OneTx)
+        vm.execute(VmExecutionMode::OneTx)
     }
 
     /// Sets the `impersonated_account` field of the node.
@@ -695,10 +744,10 @@ impl<S: std::fmt::Debug + ForkSource> InMemoryNodeInner<S> {
     pub fn archive_state(&mut self) -> Result<(), String> {
         if self.previous_states.len() > MAX_PREVIOUS_STATES as usize {
             if let Some(entry) = self.previous_states.shift_remove_index(0) {
-                log::debug!("removing archived state for previous block {:#x}", entry.0);
+                tracing::debug!("removing archived state for previous block {:#x}", entry.0);
             }
         }
-        log::debug!(
+        tracing::debug!(
             "archiving state for {:#x} #{}",
             self.current_miniblock_hash,
             self.current_miniblock
@@ -793,6 +842,17 @@ pub struct Snapshot {
     pub(crate) factory_dep_cache: HashMap<H256, Option<Vec<u8>>>,
 }
 
+/// Defines the configuration parameters for the [InMemoryNode].
+#[derive(Default, Debug, Clone)]
+pub struct InMemoryNodeConfig {
+    pub show_calls: ShowCalls,
+    pub show_storage_logs: ShowStorageLogs,
+    pub show_vm_details: ShowVMDetails,
+    pub show_gas_details: ShowGasDetails,
+    pub resolve_hashes: bool,
+    pub system_contracts_options: system_contracts::Options,
+}
+
 /// In-memory node, that can be used for local & unit testing.
 /// It also supports the option of forking testnet/mainnet.
 /// All contents are removed when object is destroyed.
@@ -813,27 +873,15 @@ fn contract_address_from_tx_result(execution_result: &VmExecutionResultAndLogs) 
 
 impl<S: ForkSource + std::fmt::Debug> Default for InMemoryNode<S> {
     fn default() -> Self {
-        InMemoryNode::new(
-            None,
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
-        )
+        InMemoryNode::new(None, None, InMemoryNodeConfig::default())
     }
 }
 
 impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
     pub fn new(
         fork: Option<ForkDetails<S>>,
-        show_calls: ShowCalls,
-        show_storage_logs: ShowStorageLogs,
-        show_vm_details: ShowVMDetails,
-        show_gas_details: ShowGasDetails,
-        resolve_hashes: bool,
-        system_contracts_options: &system_contracts::Options,
+        observability: Option<Observability>,
+        config: InMemoryNodeConfig,
     ) -> Self {
         let inner = if let Some(f) = &fork {
             let mut block_hashes = HashMap::<u64, H256>::new();
@@ -851,17 +899,18 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
                 blocks,
                 block_hashes,
                 filters: Default::default(),
-                fork_storage: ForkStorage::new(fork, system_contracts_options),
-                show_calls,
-                show_storage_logs,
-                show_vm_details,
-                show_gas_details,
-                resolve_hashes,
+                fork_storage: ForkStorage::new(fork, &config.system_contracts_options),
+                show_calls: config.show_calls,
+                show_storage_logs: config.show_storage_logs,
+                show_vm_details: config.show_vm_details,
+                show_gas_details: config.show_gas_details,
+                resolve_hashes: config.resolve_hashes,
                 console_log_handler: ConsoleLogHandler::default(),
-                system_contracts: SystemContracts::from_options(system_contracts_options),
+                system_contracts: SystemContracts::from_options(&config.system_contracts_options),
                 impersonated_accounts: Default::default(),
                 rich_accounts: HashSet::new(),
                 previous_states: Default::default(),
+                observability,
             }
         } else {
             let mut block_hashes = HashMap::<u64, H256>::new();
@@ -882,17 +931,18 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
                 blocks,
                 block_hashes,
                 filters: Default::default(),
-                fork_storage: ForkStorage::new(fork, system_contracts_options),
-                show_calls,
-                show_storage_logs,
-                show_vm_details,
-                show_gas_details,
-                resolve_hashes,
+                fork_storage: ForkStorage::new(fork, &config.system_contracts_options),
+                show_calls: config.show_calls,
+                show_storage_logs: config.show_storage_logs,
+                show_vm_details: config.show_vm_details,
+                show_gas_details: config.show_gas_details,
+                resolve_hashes: config.resolve_hashes,
                 console_log_handler: ConsoleLogHandler::default(),
-                system_contracts: SystemContracts::from_options(system_contracts_options),
+                system_contracts: SystemContracts::from_options(&config.system_contracts_options),
                 impersonated_accounts: Default::default(),
                 rich_accounts: HashSet::new(),
                 previous_states: Default::default(),
+                observability,
             }
         };
 
@@ -907,7 +957,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
 
     /// Applies multiple transactions - but still one per L1 batch.
     pub fn apply_txs(&self, txs: Vec<L2Tx>) -> Result<(), String> {
-        log::info!("Running {:?} transactions (one per batch)", txs.len());
+        tracing::info!("Running {:?} transactions (one per batch)", txs.len());
 
         for tx in txs {
             self.run_l2_tx(tx, TxExecutionMode::VerifyExecute)?;
@@ -923,7 +973,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
         let mut inner = match self.inner.write() {
             Ok(guard) => guard,
             Err(e) => {
-                log::info!("Failed to acquire write lock: {}", e);
+                tracing::info!("Failed to acquire write lock: {}", e);
                 return;
             }
         };
@@ -976,7 +1026,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
                     as Box<dyn VmTracer<StorageView<&ForkStorage<S>>, HistoryDisabled>>,
             ];
 
-        let tx_result = vm.inspect(custom_tracers, vm::VmExecutionMode::OneTx);
+        let tx_result = vm.inspect(custom_tracers, VmExecutionMode::OneTx);
 
         let call_traces = Arc::try_unwrap(call_tracer_result)
             .unwrap()
@@ -985,22 +1035,24 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
 
         match &tx_result.result {
             ExecutionResult::Success { output } => {
-                log::info!("Call: {}", "SUCCESS".green());
+                tracing::info!("Call: {}", "SUCCESS".green());
                 let output_bytes = zksync_basic_types::Bytes::from(output.clone());
-                log::info!("Output: {}", serde_json::to_string(&output_bytes).unwrap());
+                tracing::info!("Output: {}", serde_json::to_string(&output_bytes).unwrap());
             }
             ExecutionResult::Revert { output } => {
-                log::info!("Call: {}: {}", "FAILED".red(), output);
+                tracing::info!("Call: {}: {}", "FAILED".red(), output);
             }
-            ExecutionResult::Halt { reason } => log::info!("Call: {} {}", "HALTED".red(), reason),
+            ExecutionResult::Halt { reason } => {
+                tracing::info!("Call: {} {}", "HALTED".red(), reason)
+            }
         };
 
-        log::info!("=== Console Logs: ");
+        tracing::info!("=== Console Logs: ");
         for call in &call_traces {
             inner.console_log_handler.handle_call_recursive(call);
         }
 
-        log::info!("=== Call traces:");
+        tracing::info!("=== Call traces:");
         for call in &call_traces {
             formatter::print_call(call, 0, &inner.show_calls, inner.resolve_hashes);
         }
@@ -1014,151 +1066,157 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
         spent_on_pubdata: u32,
     ) -> eyre::Result<(), String> {
         if let Some(bootloader_result) = bootloader_debug_result {
-            let debug = bootloader_result.clone()?;
+            let bootloader_debug = bootloader_result.clone()?;
 
-            log::info!("┌─────────────────────────┐");
-            log::info!("│       GAS DETAILS       │");
-            log::info!("└─────────────────────────┘");
+            tracing::info!("┌─────────────────────────┐");
+            tracing::info!("│       GAS DETAILS       │");
+            tracing::info!("└─────────────────────────┘");
 
             // Total amount of gas (should match tx.gas_limit).
-            let total_gas_limit = debug
+            let total_gas_limit = bootloader_debug
                 .total_gas_limit_from_user
-                .saturating_sub(debug.reserved_gas);
+                .saturating_sub(bootloader_debug.reserved_gas);
 
-            let intrinsic_gas = total_gas_limit - debug.gas_limit_after_intrinsic;
-            let gas_for_validation = debug.gas_limit_after_intrinsic - debug.gas_after_validation;
+            let intrinsic_gas = total_gas_limit - bootloader_debug.gas_limit_after_intrinsic;
+            let gas_for_validation =
+                bootloader_debug.gas_limit_after_intrinsic - bootloader_debug.gas_after_validation;
 
-            let gas_spent_on_compute =
-                debug.gas_spent_on_execution - debug.gas_spent_on_bytecode_preparation;
+            let gas_spent_on_compute = bootloader_debug.gas_spent_on_execution
+                - bootloader_debug.gas_spent_on_bytecode_preparation;
 
             let gas_used = intrinsic_gas
                 + gas_for_validation
-                + debug.gas_spent_on_bytecode_preparation
+                + bootloader_debug.gas_spent_on_bytecode_preparation
                 + gas_spent_on_compute;
 
-            log::info!(
+            tracing::info!(
                 "Gas - Limit: {} | Used: {} | Refunded: {}",
                 to_human_size(total_gas_limit),
                 to_human_size(gas_used),
-                to_human_size(debug.refund_by_operator)
+                to_human_size(bootloader_debug.refund_by_operator)
             );
 
-            if debug.total_gas_limit_from_user != total_gas_limit {
-                log::info!(
+            if bootloader_debug.total_gas_limit_from_user != total_gas_limit {
+                tracing::info!(
                     "{}",
                     format!(
                 "  WARNING: user actually provided more gas {}, but system had a lower max limit.",
-                to_human_size(debug.total_gas_limit_from_user)
+                to_human_size(bootloader_debug.total_gas_limit_from_user)
             )
                     .yellow()
                 );
             }
-            if debug.refund_computed != debug.refund_by_operator {
-                log::info!(
+            if bootloader_debug.refund_computed != bootloader_debug.refund_by_operator {
+                tracing::info!(
                     "{}",
                     format!(
                         "  WARNING: Refund by VM: {}, but operator refunded more: {}",
-                        to_human_size(debug.refund_computed),
-                        to_human_size(debug.refund_by_operator)
+                        to_human_size(bootloader_debug.refund_computed),
+                        to_human_size(bootloader_debug.refund_by_operator)
                     )
                     .yellow()
                 );
             }
 
-            if debug.refund_computed + gas_used != total_gas_limit {
-                log::info!(
+            if bootloader_debug.refund_computed + gas_used != total_gas_limit {
+                tracing::info!(
                     "{}",
                     format!(
                         "  WARNING: Gas totals don't match. {} != {} , delta: {}",
-                        to_human_size(debug.refund_computed + gas_used),
+                        to_human_size(bootloader_debug.refund_computed + gas_used),
                         to_human_size(total_gas_limit),
-                        to_human_size(total_gas_limit.abs_diff(debug.refund_computed + gas_used))
+                        to_human_size(
+                            total_gas_limit.abs_diff(bootloader_debug.refund_computed + gas_used)
+                        )
                     )
                     .yellow()
                 );
             }
 
-            let bytes_published = spent_on_pubdata / debug.gas_per_pubdata.as_u32();
+            let bytes_published = spent_on_pubdata / bootloader_debug.gas_per_pubdata.as_u32();
 
-            log::info!(
+            tracing::info!(
                 "During execution published {} bytes to L1, @{} each - in total {} gas",
                 to_human_size(bytes_published.into()),
-                to_human_size(debug.gas_per_pubdata),
+                to_human_size(bootloader_debug.gas_per_pubdata),
                 to_human_size(spent_on_pubdata.into())
             );
 
-            log::info!("Out of {} gas used, we spent:", to_human_size(gas_used));
-            log::info!(
+            tracing::info!("Out of {} gas used, we spent:", to_human_size(gas_used));
+            tracing::info!(
                 "  {:>15} gas ({:>2}%) for transaction setup",
                 to_human_size(intrinsic_gas),
                 to_human_size(intrinsic_gas * 100 / gas_used)
             );
-            log::info!(
+            tracing::info!(
                 "  {:>15} gas ({:>2}%) for bytecode preparation (decompression etc)",
-                to_human_size(debug.gas_spent_on_bytecode_preparation),
-                to_human_size(debug.gas_spent_on_bytecode_preparation * 100 / gas_used)
+                to_human_size(bootloader_debug.gas_spent_on_bytecode_preparation),
+                to_human_size(bootloader_debug.gas_spent_on_bytecode_preparation * 100 / gas_used)
             );
-            log::info!(
+            tracing::info!(
                 "  {:>15} gas ({:>2}%) for account validation",
                 to_human_size(gas_for_validation),
                 to_human_size(gas_for_validation * 100 / gas_used)
             );
-            log::info!(
+            tracing::info!(
                 "  {:>15} gas ({:>2}%) for computations (opcodes)",
                 to_human_size(gas_spent_on_compute),
                 to_human_size(gas_spent_on_compute * 100 / gas_used)
             );
 
-            log::info!("");
-            log::info!("");
-            log::info!(
+            tracing::info!("");
+            tracing::info!("");
+            tracing::info!(
                 "{}",
                 "=== Transaction setup cost breakdown ===".to_owned().bold(),
             );
 
-            log::info!("Total cost: {}", to_human_size(intrinsic_gas).bold());
-            log::info!(
+            tracing::info!("Total cost: {}", to_human_size(intrinsic_gas).bold());
+            tracing::info!(
                 "  {:>15} gas ({:>2}%) fixed cost",
-                to_human_size(debug.intrinsic_overhead),
-                to_human_size(debug.intrinsic_overhead * 100 / intrinsic_gas)
+                to_human_size(bootloader_debug.intrinsic_overhead),
+                to_human_size(bootloader_debug.intrinsic_overhead * 100 / intrinsic_gas)
             );
-            log::info!(
+            tracing::info!(
                 "  {:>15} gas ({:>2}%) operator cost",
-                to_human_size(debug.operator_overhead),
-                to_human_size(debug.operator_overhead * 100 / intrinsic_gas)
+                to_human_size(bootloader_debug.operator_overhead),
+                to_human_size(bootloader_debug.operator_overhead * 100 / intrinsic_gas)
             );
 
-            log::info!("");
-            log::info!(
+            tracing::info!("");
+            tracing::info!(
                 "  FYI: operator could have charged up to: {}, so you got {}% discount",
-                to_human_size(debug.required_overhead),
+                to_human_size(bootloader_debug.required_overhead),
                 to_human_size(
-                    (debug.required_overhead - debug.operator_overhead) * 100
-                        / debug.required_overhead
+                    (bootloader_debug.required_overhead - bootloader_debug.operator_overhead) * 100
+                        / bootloader_debug.required_overhead
                 )
             );
 
             let publish_block_l1_bytes = BLOCK_OVERHEAD_PUBDATA;
-            log::info!(
+            tracing::info!(
             "Publishing full block costs the operator up to: {}, where {} is due to {} bytes published to L1",
-            to_human_size(debug.total_overhead_for_block),
-            to_human_size(debug.gas_per_pubdata * publish_block_l1_bytes),
+            to_human_size(bootloader_debug.total_overhead_for_block),
+            to_human_size(bootloader_debug.gas_per_pubdata * publish_block_l1_bytes),
             to_human_size(publish_block_l1_bytes.into())
         );
-            log::info!("Your transaction has contributed to filling up the block in the following way (we take the max contribution as the cost):");
-            log::info!(
+            tracing::info!("Your transaction has contributed to filling up the block in the following way (we take the max contribution as the cost):");
+            tracing::info!(
                 "  Circuits overhead:{:>15} ({}% of the full block: {})",
-                to_human_size(debug.overhead_for_circuits),
-                to_human_size(debug.overhead_for_circuits * 100 / debug.total_overhead_for_block),
-                to_human_size(debug.total_overhead_for_block)
+                to_human_size(bootloader_debug.overhead_for_circuits),
+                to_human_size(
+                    bootloader_debug.overhead_for_circuits * 100
+                        / bootloader_debug.total_overhead_for_block
+                ),
+                to_human_size(bootloader_debug.total_overhead_for_block)
             );
-            log::info!(
+            tracing::info!(
                 "  Length overhead:  {:>15}",
-                to_human_size(debug.overhead_for_length)
+                to_human_size(bootloader_debug.overhead_for_length)
             );
-            log::info!(
+            tracing::info!(
                 "  Slot overhead:    {:>15}",
-                to_human_size(debug.overhead_for_slot)
+                to_human_size(bootloader_debug.overhead_for_slot)
             );
             Ok(())
         } else {
@@ -1223,26 +1281,26 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
             }) as Box<dyn VmTracer<StorageView<&ForkStorage<S>>, HistoryDisabled>>,
         ];
 
-        let tx_result = vm.inspect(custom_tracers, vm::VmExecutionMode::OneTx);
+        let tx_result = vm.inspect(custom_tracers, VmExecutionMode::OneTx);
 
         let call_traces = call_tracer_result.get().unwrap();
 
         let spent_on_pubdata =
             tx_result.statistics.gas_used - tx_result.statistics.computational_gas_used;
 
-        log::info!("┌─────────────────────────┐");
-        log::info!("│   TRANSACTION SUMMARY   │");
-        log::info!("└─────────────────────────┘");
+        tracing::info!("┌─────────────────────────┐");
+        tracing::info!("│   TRANSACTION SUMMARY   │");
+        tracing::info!("└─────────────────────────┘");
 
         match &tx_result.result {
-            ExecutionResult::Success { .. } => log::info!("Transaction: {}", "SUCCESS".green()),
-            ExecutionResult::Revert { .. } => log::info!("Transaction: {}", "FAILED".red()),
-            ExecutionResult::Halt { .. } => log::info!("Transaction: {}", "HALTED".red()),
+            ExecutionResult::Success { .. } => tracing::info!("Transaction: {}", "SUCCESS".green()),
+            ExecutionResult::Revert { .. } => tracing::info!("Transaction: {}", "FAILED".red()),
+            ExecutionResult::Halt { .. } => tracing::info!("Transaction: {}", "HALTED".red()),
         }
 
-        log::info!("Initiator: {:?}", tx.initiator_account());
-        log::info!("Payer: {:?}", tx.payer());
-        log::info!(
+        tracing::info!("Initiator: {:?}", tx.initiator_account());
+        tracing::info!("Payer: {:?}", tx.payer());
+        tracing::info!(
             "Gas - Limit: {} | Used: {} | Refunded: {}",
             to_human_size(tx.gas_limit()),
             to_human_size(tx.gas_limit() - tx_result.refunds.gas_refunded),
@@ -1250,7 +1308,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
         );
 
         match inner.show_gas_details {
-            ShowGasDetails::None => log::info!(
+            ShowGasDetails::None => tracing::info!(
                 "Use --show-gas-details flag or call config_setShowGasDetails to display more info"
             ),
             ShowGasDetails::All => {
@@ -1258,7 +1316,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
                     .display_detailed_gas_info(bootloader_debug_result.get(), spent_on_pubdata)
                     .is_err()
                 {
-                    log::info!(
+                    tracing::info!(
                         "{}",
                         "!!! FAILED TO GET DETAILED GAS INFO !!!".to_owned().red()
                     );
@@ -1267,10 +1325,10 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
         }
 
         if inner.show_storage_logs != ShowStorageLogs::None {
-            log::info!("");
-            log::info!("┌──────────────────┐");
-            log::info!("│   STORAGE LOGS   │");
-            log::info!("└──────────────────┘");
+            tracing::info!("");
+            tracing::info!("┌──────────────────┐");
+            tracing::info!("│   STORAGE LOGS   │");
+            tracing::info!("└──────────────────┘");
         }
 
         for log_query in &tx_result.logs.storage_logs {
@@ -1299,19 +1357,19 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
             formatter::print_vm_details(&tx_result);
         }
 
-        log::info!("");
-        log::info!("==== Console logs: ");
+        tracing::info!("");
+        tracing::info!("==== Console logs: ");
         for call in call_traces {
             inner.console_log_handler.handle_call_recursive(call);
         }
-        log::info!("");
+        tracing::info!("");
         let call_traces_count = if !call_traces.is_empty() {
             // All calls/sub-calls are stored within the first call trace
             call_traces[0].calls.len()
         } else {
             0
         };
-        log::info!(
+        tracing::info!(
             "==== {} Use --show-calls flag or call config_setShowCalls to display more info.",
             format!("{:?} call traces. ", call_traces_count).bold()
         );
@@ -1321,8 +1379,8 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
                 formatter::print_call(call, 0, &inner.show_calls, inner.resolve_hashes);
             }
         }
-        log::info!("");
-        log::info!(
+        tracing::info!("");
+        tracing::info!(
             "==== {}",
             format!("{} events", tx_result.logs.events.len()).bold()
         );
@@ -1355,8 +1413,8 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
             ..Default::default()
         };
 
-        log::info!("");
-        log::info!("");
+        tracing::info!("");
+        tracing::info!("");
 
         let bytecodes = vm
             .get_last_tx_compressed_bytecodes()
@@ -1364,17 +1422,24 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
             .map(|b| bytecode_to_factory_dep(b.original.clone()))
             .collect();
 
-        vm.execute(vm::VmExecutionMode::Bootloader);
+        vm.execute(VmExecutionMode::Bootloader);
 
         let modified_keys = storage.borrow().modified_storage_keys().clone();
-        Ok((modified_keys, tx_result, block, bytecodes, block_ctx))
+        Ok((
+            modified_keys,
+            tx_result,
+            call_traces.clone(),
+            block,
+            bytecodes,
+            block_ctx,
+        ))
     }
 
     /// Runs L2 transaction and commits it to a new block.
     fn run_l2_tx(&self, l2_tx: L2Tx, execution_mode: TxExecutionMode) -> Result<(), String> {
         let tx_hash = l2_tx.hash();
-        log::info!("");
-        log::info!("Executing {}", format!("{:?}", tx_hash).bold());
+        tracing::info!("");
+        tracing::info!("Executing {}", format!("{:?}", tx_hash).bold());
 
         {
             let mut inner = self
@@ -1384,7 +1449,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
             inner.filters.notify_new_pending_transaction(tx_hash);
         }
 
-        let (keys, result, block, bytecodes, block_ctx) =
+        let (keys, result, call_traces, block, bytecodes, block_ctx) =
             self.run_l2_tx_inner(l2_tx.clone(), execution_mode)?;
 
         if let ExecutionResult::Halt { reason } = result.result {
@@ -1476,6 +1541,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
             effective_gas_price: Some(L2_GAS_PRICE.into()),
             ..Default::default()
         };
+        let debug = create_debug_output(&l2_tx, &result, call_traces).expect("create debug output"); // OK to unwrap here as Halt is handled above
         inner.tx_results.insert(
             tx_hash,
             TransactionResult {
@@ -1486,6 +1552,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
                     result,
                 },
                 receipt: tx_receipt,
+                debug,
             },
         );
 
@@ -1501,7 +1568,7 @@ impl<S: ForkSource + std::fmt::Debug> InMemoryNode<S> {
         for block in vec![block, empty_block_at_end_of_batch] {
             // archive current state before we produce new batch/blocks
             if let Err(err) = inner.archive_state() {
-                log::error!(
+                tracing::error!(
                     "failed archiving state for block {}: {}",
                     inner.current_miniblock,
                     err
@@ -1590,7 +1657,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
     /// Returns the chain ID of the node.
     fn chain_id(&self) -> jsonrpc_core::BoxFuture<jsonrpc_core::Result<zksync_basic_types::U64>> {
         match self.inner.read() {
-            Ok(inner) => Ok(U64::from(inner.fork_storage.chain_id.0 as u64)).into_boxed_future(),
+            Ok(inner) => Ok(U64::from(inner.fork_storage.chain_id.as_u64())).into_boxed_future(),
             Err(_) => Err(into_jsrpc_error(Web3Error::InternalError)).into_boxed_future(),
         }
     }
@@ -1632,7 +1699,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
                                 message
                             );
 
-                            log::info!("{}", pretty_message.on_red());
+                            tracing::info!("{}", pretty_message.on_red());
                             Err(into_jsrpc_error(Web3Error::SubmitTransactionError(
                                 pretty_message,
                                 output.encoded_data(),
@@ -1647,7 +1714,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
                                 message
                             );
 
-                            log::info!("{}", pretty_message.on_red());
+                            tracing::info!("{}", pretty_message.on_red());
                             Err(into_jsrpc_error(Web3Error::SubmitTransactionError(
                                 pretty_message,
                                 vec![],
@@ -1820,7 +1887,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
 
                     let code = guard
                         .fork_storage
-                        .load_factory_dep_internal(code_hash)
+                        .load_factory_dep(code_hash)
                         .unwrap_or_default();
 
                     Ok(Bytes::from(code))
@@ -1909,7 +1976,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
             }
         };
 
-        let (tx_req, hash) = match TransactionRequest::from_bytes(&tx_bytes.0, chain_id.0) {
+        let (tx_req, hash) = match TransactionRequest::from_bytes(&tx_bytes.0, chain_id) {
             Ok(result) => result,
             Err(e) => {
                 return futures::future::err(into_jsrpc_error(Web3Error::SerializationError(e)))
@@ -2082,7 +2149,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
                         max_priority_fee_per_gas: Some(
                             info.tx.common_data.fee.max_priority_fee_per_gas,
                         ),
-                        chain_id: chain_id.into(),
+                        chain_id: U256::from(chain_id),
                         l1_batch_number: Some(U64::from(info.batch_number as u64)),
                         l1_batch_tx_index: None,
                     })
@@ -2170,11 +2237,11 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
     ///
     /// If the from `fromBlock` or `toBlock` option are equal to "latest" the filter continually appends logs for newly mined blocks.
     /// Topics are order-dependent. A transaction with a log with topics [A, B] will be matched by the following topic filters:
-    ///     * [] "anything"
-    ///     * [A] "A in first position (and anything after)"
-    ///     * [null, B] "anything in first position AND B in second position (and anything after)"
-    ///     * [A, B] "A in first position AND B in second position (and anything after)"
-    ///     * [[A, B], [A, B]] "(A OR B) in first position AND (A OR B) in second position (and anything after)"
+    ///     * \[\] "anything"
+    ///     * \[A\] "A in first position (and anything after)"
+    ///     * \[null, B\] "anything in first position AND B in second position (and anything after)"
+    ///     * \[A, B\] "A in first position AND B in second position (and anything after)"
+    ///     * \[\[A, B\], \[A, B\]\] "(A OR B) in first position AND (A OR B) in second position (and anything after)"
     ///
     /// # Returns
     ///
@@ -2553,7 +2620,10 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
                         .get(&o.block_hash)
                         .map(|block| block.number)
                         .ok_or_else(|| {
-                            log::error!("unable to map block number to hash #{:#x}", o.block_hash);
+                            tracing::error!(
+                                "unable to map block number to hash #{:#x}",
+                                o.block_hash
+                            );
                             into_jsrpc_error(Web3Error::InternalError)
                         }),
                 })
@@ -2585,7 +2655,7 @@ impl<S: Send + Sync + 'static + ForkSource + std::fmt::Debug> EthNamespaceT for 
                     .as_ref()
                     .and_then(|fork| fork.fork_source.get_storage_at(address, idx, block).ok())
                     .ok_or_else(|| {
-                        log::error!(
+                        tracing::error!(
                             "unable to get storage at address {:?}, index {:?} for block {:?}",
                             address,
                             idx,
@@ -2864,7 +2934,10 @@ mod tests {
         cache::CacheConfig,
         http_fork_source::HttpForkSource,
         node::InMemoryNode,
-        testing::{self, ForkBlockConfig, LogBuilder, MockServer, TransactionResponseBuilder},
+        testing::{
+            self, default_tx_debug_info, ForkBlockConfig, LogBuilder, MockServer,
+            TransactionResponseBuilder,
+        },
     };
     use maplit::hashmap;
     use zksync_basic_types::Nonce;
@@ -3008,12 +3081,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let inner = node.inner.read().unwrap();
@@ -3055,12 +3124,8 @@ mod tests {
         );
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_block = node
@@ -3127,12 +3192,8 @@ mod tests {
         );
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_block = node
@@ -3179,12 +3240,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_block = node
@@ -3219,12 +3276,8 @@ mod tests {
         );
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_block = node
@@ -3250,12 +3303,8 @@ mod tests {
             });
             let node = InMemoryNode::<HttpForkSource>::new(
                 Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-                crate::node::ShowCalls::None,
-                ShowStorageLogs::None,
-                ShowVMDetails::None,
-                ShowGasDetails::None,
-                false,
-                &system_contracts::Options::BuiltIn,
+                None,
+                Default::default(),
             );
 
             let actual_block = node
@@ -3312,12 +3361,8 @@ mod tests {
         );
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_transaction_count = node
@@ -3373,12 +3418,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_transaction_count = node
@@ -3419,12 +3460,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_transaction_count = node
@@ -3456,12 +3493,8 @@ mod tests {
 
             let node = InMemoryNode::<HttpForkSource>::new(
                 Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-                crate::node::ShowCalls::None,
-                ShowStorageLogs::None,
-                ShowVMDetails::None,
-                ShowGasDetails::None,
-                false,
-                &system_contracts::Options::BuiltIn,
+                None,
+                Default::default(),
             );
 
             let actual_transaction_count = node
@@ -3734,12 +3767,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_value = node
@@ -3833,12 +3862,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
         node.inner
             .write()
@@ -3981,6 +4006,7 @@ mod tests {
                             .build()],
                         ..Default::default()
                     },
+                    debug: default_tx_debug_info(),
                 },
             );
             writer.tx_results.insert(
@@ -3998,6 +4024,7 @@ mod tests {
                         ],
                         ..Default::default()
                     },
+                    debug: default_tx_debug_info(),
                 },
             );
         }
@@ -4037,6 +4064,7 @@ mod tests {
                             .build()],
                         ..Default::default()
                     },
+                    debug: default_tx_debug_info(),
                 },
             );
         }
@@ -4064,6 +4092,7 @@ mod tests {
                             .build()],
                         ..Default::default()
                     },
+                    debug: testing::default_tx_debug_info(),
                 },
             );
             writer.tx_results.insert(
@@ -4081,6 +4110,7 @@ mod tests {
                         ],
                         ..Default::default()
                     },
+                    debug: testing::default_tx_debug_info(),
                 },
             );
         }
@@ -4148,6 +4178,7 @@ mod tests {
             TransactionResult {
                 info: testing::default_tx_execution_info(),
                 receipt: Default::default(),
+                debug: testing::default_tx_debug_info(),
             },
         );
         inner.current_batch = 1;
@@ -4249,6 +4280,7 @@ mod tests {
             TransactionResult {
                 info: testing::default_tx_execution_info(),
                 receipt: Default::default(),
+                debug: testing::default_tx_debug_info(),
             },
         );
         inner.current_batch = 1;
@@ -4301,6 +4333,7 @@ mod tests {
             TransactionResult {
                 info: testing::default_tx_execution_info(),
                 receipt: Default::default(),
+                debug: default_tx_debug_info(),
             },
         );
         inner.current_batch = 2;
@@ -4429,12 +4462,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         // store the block info with just the tx hash invariant
@@ -4487,12 +4516,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_tx = node
@@ -4586,12 +4611,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         // store the block info with just the tx hash invariant
@@ -4651,12 +4672,8 @@ mod tests {
 
         let node = InMemoryNode::<HttpForkSource>::new(
             Some(ForkDetails::from_network(&mock_server.url(), None, CacheConfig::None).await),
-            crate::node::ShowCalls::None,
-            ShowStorageLogs::None,
-            ShowVMDetails::None,
-            ShowGasDetails::None,
-            false,
-            &system_contracts::Options::BuiltIn,
+            None,
+            Default::default(),
         );
 
         let actual_tx = node

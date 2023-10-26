@@ -5,7 +5,7 @@
 
 use std::{
     collections::HashMap,
-    convert::TryInto,
+    convert::{TryFrom, TryInto},
     future::Future,
     sync::{Arc, RwLock},
 };
@@ -14,7 +14,10 @@ use tokio::runtime::Builder;
 use zksync_basic_types::{Address, L1BatchNumber, L2ChainId, MiniblockNumber, H256, U256, U64};
 
 use zksync_types::{
-    api::{Block, BlockIdVariant, BlockNumber, Transaction, TransactionVariant},
+    api::{
+        Block, BlockDetails, BlockIdVariant, BlockNumber, BridgeAddresses, Transaction,
+        TransactionDetails, TransactionVariant,
+    },
     l2::L2Tx,
     ProtocolVersionId, StorageKey,
 };
@@ -76,8 +79,8 @@ impl<S: ForkSource> ForkStorage<S> {
         let chain_id = fork
             .as_ref()
             .and_then(|d| d.overwrite_chain_id)
-            .unwrap_or(L2ChainId(TEST_NODE_NETWORK_ID));
-        log::info!("Starting network with chain id: {:?}", chain_id);
+            .unwrap_or(L2ChainId::from(TEST_NODE_NETWORK_ID));
+        tracing::info!("Starting network with chain id: {:?}", chain_id);
 
         ForkStorage {
             inner: Arc::new(RwLock::new(ForkStorageInner {
@@ -127,7 +130,7 @@ impl<S: ForkSource> ForkStorage<S> {
         }
     }
 
-    pub fn load_factory_dep_internal(&self, hash: H256) -> Option<Vec<u8>> {
+    fn load_factory_dep_internal(&self, hash: H256) -> Option<Vec<u8>> {
         let mut mutator = self.inner.write().unwrap();
         let local_storage = mutator.raw_storage.load_factory_dep(hash);
         if let Some(fork) = &mutator.fork {
@@ -202,8 +205,12 @@ pub trait ForkSource {
 
     /// Returns the bytecode stored under this hash (if available).
     fn get_bytecode_by_hash(&self, hash: H256) -> eyre::Result<Option<Vec<u8>>>;
+
     /// Returns the transaction for a given hash.
     fn get_transaction_by_hash(&self, hash: H256) -> eyre::Result<Option<Transaction>>;
+
+    /// Returns the transaction details for a given hash.
+    fn get_transaction_details(&self, hash: H256) -> eyre::Result<Option<TransactionDetails>>;
 
     /// Gets all transactions that belong to a given miniblock.
     fn get_raw_block_transactions(
@@ -224,6 +231,9 @@ pub trait ForkSource {
         block_number: zksync_types::api::BlockNumber,
         full_transactions: bool,
     ) -> eyre::Result<Option<Block<TransactionVariant>>>;
+
+    /// Returns the block details for a given miniblock number.
+    fn get_block_details(&self, miniblock: MiniblockNumber) -> eyre::Result<Option<BlockDetails>>;
 
     /// Returns the  transaction count for a given block hash.
     fn get_block_transaction_count_by_hash(&self, block_hash: H256) -> eyre::Result<Option<U256>>;
@@ -247,6 +257,16 @@ pub trait ForkSource {
         block_number: BlockNumber,
         index: Index,
     ) -> eyre::Result<Option<Transaction>>;
+
+    /// Returns addresses of the default bridge contracts.
+    fn get_bridge_contracts(&self) -> eyre::Result<BridgeAddresses>;
+
+    /// Returns confirmed tokens
+    fn get_confirmed_tokens(
+        &self,
+        from: u32,
+        limit: u8,
+    ) -> eyre::Result<Vec<zksync_web3_decl::types::Token>>;
 }
 
 /// Holds the information about the original chain.
@@ -270,6 +290,7 @@ const SUPPORTED_VERSIONS: &[ProtocolVersionId] = &[
     ProtocolVersionId::Version13,
     ProtocolVersionId::Version14,
     ProtocolVersionId::Version15,
+    ProtocolVersionId::Version16,
 ];
 
 pub fn supported_protocol_versions(version: ProtocolVersionId) -> bool {
@@ -305,8 +326,7 @@ impl ForkDetails<HttpForkSource> {
         let block = client
             .get_block_by_hash(root_hash, true)
             .await
-            .ok()
-            .flatten()
+            .expect("failed retrieving block")
             .unwrap_or_else(|| {
                 panic!(
                     "Could not find block #{:?} ({:#x}) in {:?}",
@@ -315,7 +335,7 @@ impl ForkDetails<HttpForkSource> {
             });
         let l1_batch_number = block_details.l1_batch_number;
 
-        log::info!(
+        tracing::info!(
             "Creating fork from {:?} L1 block: {:?} L2 block: {:?} with timestamp {:?}, L1 gas price {:?} and protocol version: {:?}" ,
             url, l1_batch_number, miniblock, block_details.base.timestamp, block_details.base.l1_gas_price, block_details.protocol_version
         );
@@ -359,7 +379,11 @@ impl ForkDetails<HttpForkSource> {
     pub async fn from_network_tx(fork: &str, tx: H256, cache_config: CacheConfig) -> Self {
         let (url, client) = Self::fork_to_url_and_client(fork);
         let tx_details = client.get_transaction_by_hash(tx).await.unwrap().unwrap();
-        let overwrite_chain_id = Some(L2ChainId(tx_details.chain_id.as_u32() as u16));
+        let overwrite_chain_id = Some(
+            L2ChainId::try_from(tx_details.chain_id.as_u64()).unwrap_or_else(|err| {
+                panic!("erroneous chain id {}: {:?}", tx_details.chain_id, err,)
+            }),
+        );
         let miniblock_number = MiniblockNumber(tx_details.block_number.unwrap().as_u32());
         // We have to sync to the one-miniblock before the one where transaction is.
         let l2_miniblock = miniblock_number.saturating_sub(1) as u64;
