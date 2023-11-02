@@ -1,4 +1,5 @@
 use std::{collections::HashMap, str::FromStr};
+use std::io::Write;
 
 use colored::Colorize;
 use ethabi::param_type::Reader;
@@ -41,6 +42,23 @@ impl ConsoleLogHandler {
             self.handle_call_recursive(call);
         }
     }
+
+    pub fn print_to_file(&self, message: String) -> () {
+        let path = "logs.txt";
+
+        let b = std::path::Path::new(path).exists();
+
+        let mut _output :std::fs::File;
+        if !b {
+            _output = std::fs::File::create(&path).unwrap();
+        } else {
+            _output = std::fs::File::options().append(true).open(&path).unwrap();
+        }
+        
+        let _ = _output.write_all(message.as_bytes());
+    }
+    
+
     pub fn handle_call(&self, current_call: &Call) {
         if current_call.to != self.target_contract {
             return;
@@ -60,6 +78,7 @@ impl ConsoleLogHandler {
                     })
                 });
         tracing::info!("{}", message.cyan());
+        self.print_to_file(message.to_string() + "\n");
     }
 }
 
